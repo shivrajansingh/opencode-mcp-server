@@ -2031,7 +2031,7 @@ function registerTools(server, ctx, profile = "full") {
 }
 
 // src/index.ts
-var VERSION = "0.1.0";
+var VERSION = true ? "0.2.1" : "0.0.0";
 function parseArgs(argv) {
   const options = {
     command: "serve",

@@ -8,7 +8,9 @@ import { log, registerSecret } from "./log.js"
 import { registerTools, type ToolProfile } from "./tools/index.js"
 import type { ServerContext } from "./tools/shared.js"
 
-const VERSION = "0.1.0"
+declare const __APP_VERSION__: string
+
+const VERSION = typeof __APP_VERSION__ === "string" ? __APP_VERSION__ : "0.0.0"
 
 interface CliOptions {
   command: "serve" | "configure" | "status" | "help" | "version"
