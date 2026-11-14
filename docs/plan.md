@@ -13,7 +13,7 @@
 
 Shipped and verified against a live OpenCode 2.2.5 server:
 
-- All 18 tools registered over both **stdio** and **Streamable HTTP** (bearer token), plus an
+- All 19 tools registered over both **stdio** and **Streamable HTTP** (bearer token), plus an
   authenticated `POST /configure` settings endpoint on the HTTP transport.
 - Config precedence (runtime → env → file), 0600 config file, `configure` CLI, `opencode_configure` tool.
 - Unconfigured start-up with actionable `opencode_status` and clean tool errors.
@@ -22,8 +22,9 @@ Shipped and verified against a live OpenCode 2.2.5 server:
   `opencode_task`; `data:` attachment round-trip; in-chat configure (including wrong-password and
   remote-host rejection); model assignment at session, project, global and agent scope (JSONC-safe).
 - **Agentic end-to-end**: `scripts/agentic-smoke.mjs` has the `build` agent write a file and run a
-  shell command through `opencode_task`, then asserts the file on disk and the `write`/`shell` tool
-  calls in the transcript. This is the proof that a client can *make OpenCode work*, not just chat.
+  shell command through `opencode_task`, then asserts the file on disk and that the response hides
+  `tools`/`messages`. This is the proof that a client can *make OpenCode work* while only seeing the
+  final summary.
 - 34 unit tests (config precedence, URL policy, workspace resolution/allowlist, redaction, JSONC model edits).
 - Scripts: `scripts/smoke.mjs` (stdio) and `scripts/http-smoke.mjs` (HTTP).
 
@@ -280,10 +281,17 @@ side-table `sessionID → { directory, configuredAt, toolset }` for fast policy 
 
 `session.prompt()` returns immediately with an inbox item; it does **not** return the answer. So:
 
-- `opencode_session_prompt` defaults to `wait: true, timeoutMs: 45000`:
-  post prompt → `experimental.session.wait` → read new messages → return assistant text, tool
-  summary, and token/cost delta. 45 s is deliberately below the ~60 s request timeout most MCP
-  clients enforce; callers that raise their own timeout can pass a larger `timeoutMs` (max 1 h).
+- `opencode_session_prompt` defaults to `wait: true, timeoutMs: 45000` and **summary verbosity**:
+  post prompt → `experimental.session.wait` → read new messages → return only
+  `{ status, summary, durationMs }`. Tool calls, intermediate turns and reasoning never cross the MCP
+  boundary, so the orchestrator's context is not polluted. `verbosity: "full"` is opt-in.
+- While waiting, generic `notifications/progress` messages ("OpenCode is working… 12s") are sent when
+  the client supplies a progress token. They carry no tool or content details.
+- `background: true` creates an in-memory job and returns `{ jobID, status: "working" }` immediately;
+  `opencode_job` returns `{ status: "done", summary }` once finished. Jobs are process-local (lost on
+  restart) and capped at 100.
+- Provider failures are surfaced as `status: "error"` with `error.type`/`error.message`, never as a
+  silent empty summary.
 - When the wait elapses the tool returns `status: "timeout"` (or `"running"` with `wait: false`) plus a
   hint to poll `opencode_session_history` or interrupt — the session keeps running in OpenCode.
 - `wait: false` returns `{ sessionID, status: "running" }`; the client polls `history` or calls
@@ -298,7 +306,7 @@ side-table `sessionID → { directory, configuredAt, toolset }` for fast policy 
 ## 5. Tool catalog
 
 Conventions: every tool accepts optional `directory`; every tool returns `{ ok, data }` or a typed
-error. Names are prefixed `opencode_`. **18 tools**, with a `--profile minimal` variant (9).
+error. Names are prefixed `opencode_`. **19 tools**, with a `--profile minimal` variant (10).
 
 ### 5.1 Configuration & workspace
 
@@ -418,14 +426,21 @@ pull outputs back (diffs, generated files, reports).
 opencode_agent({ action: "list" | "set" | "delegate" })
 opencode_task({
   directory?, prompt, agent?: "general" | "explore" | string,
-  title?, model?, wait?: true, timeoutMs?: 600_000
-}) -> { sessionID, parentSessionID, text, tools, usage }
+  title?, model?, wait?: true, timeoutMs?: 45_000,
+  verbosity?: "summary" | "full", background?: boolean
+}) -> { sessionID, parentSessionID, status, summary, durationMs }
+
+opencode_job({ action: "status" | "list" | "cancel", jobID?, limit? })
+  -> { jobID, sessionID, status, summary?, error?, elapsedMs? }
 ```
 
 - `list` → `client.agent.list()` (verified live: `build`, `general`, `explore`, …).
 - `set` → `client.session.switchAgent({ sessionID, agent })`.
-- `delegate` / `opencode_task` → create a **child session** (`parentID` + `agent`), prompt, wait,
-  return the result *and* the child `sessionID` so the caller can inspect the subagent transcript.
+- `delegate` / `opencode_task` → create a session (`parentID` + `agent`), prompt, wait, and return
+  **only the final summary**. Tool calls and intermediate turns are the caller's opt-in
+  (`verbosity: "full"`), so an orchestrator's context stays clean.
+- `background: true` returns `{ jobID, status: "working" }` immediately; `opencode_job` collects the
+  summary later. Jobs are in-memory (max 100, lost on restart).
 - Mid-run delegation: pass `agents: [{ name: "explore" }]` on a normal prompt; OpenCode's own model
   decides when to spawn it.
 
@@ -656,7 +671,7 @@ opencode-mcp-server/
 
 ## 13. Definition of done
 
-1. `npx opencode-mcp-server` starts **unconfigured**, lists 18 tools, and `opencode_status` explains
+1. `npx opencode-mcp-server` starts **unconfigured**, lists 19 tools, and `opencode_status` explains
    exactly what is missing.
 2. Supplying `OPENCODE_URL` + `OPENCODE_PASSWORD` (env, CLI, or `opencode_configure` in-chat) flips
    it to healthy; wrong credentials give a 401-specific message; a v1 server is refused with an

@@ -45,11 +45,12 @@ function text(result) {
 const url = process.env.OPENCODE_URL
 const password = process.env.OPENCODE_PASSWORD
 const live = Boolean(url && password)
+const MODEL = process.env.SMOKE_MODEL ? (([providerID, id]) => ({ providerID, id }))(process.env.SMOKE_MODEL.split("/")) : undefined
 
 console.log("1. unconfigured server")
 await withClient({ OPENCODE_URL: "", OPENCODE_PASSWORD: "" }, async (client) => {
   const tools = await client.listTools()
-  check("lists 18 tools", tools.tools.length === 18, `got ${tools.tools.length}`)
+  check("lists 19 tools", tools.tools.length === 19, `got ${tools.tools.length}`)
   check(
     "tool names are prefixed",
     tools.tools.every((tool) => tool.name.startsWith("opencode_")),
@@ -69,7 +70,7 @@ await withClient({ OPENCODE_URL: "", OPENCODE_PASSWORD: "" }, async (client) => 
 console.log("\n1b. minimal profile")
 await withClient({ OPENCODE_URL: "", OPENCODE_PASSWORD: "" }, async (client) => {
   const tools = await client.listTools()
-  check("minimal profile lists 9 tools", tools.tools.length === 9, `got ${tools.tools.length}`)
+  check("minimal profile lists 10 tools", tools.tools.length === 10, `got ${tools.tools.length}`)
   check("minimal profile excludes mcp admin", !tools.tools.some((tool) => tool.name === "opencode_mcp"))
 }, ["--profile", "minimal"])
 
@@ -129,7 +130,7 @@ await withClient({ OPENCODE_URL: url, OPENCODE_PASSWORD: password }, async (clie
     text(
       await client.callTool({
         name: "opencode_session_create",
-        arguments: { title: "mcp smoke test", directory: cwd },
+        arguments: { title: "mcp smoke test", directory: cwd, ...(MODEL ? { model: MODEL } : {}) },
       }),
     ),
   )
@@ -154,8 +155,9 @@ await withClient({ OPENCODE_URL: url, OPENCODE_PASSWORD: password }, async (clie
       ),
     )
     check("prompt completed", prompt.status === "idle", prompt.status)
-    check("assistant replied", typeof prompt.text === "string" && prompt.text.length > 0, prompt.text?.slice(0, 120))
-    console.log(`      (${Math.round((Date.now() - started) / 1000)}s, model=${prompt.usage ? "reported" : "n/a"})`)
+    check("summary returned", typeof prompt.summary === "string" && prompt.summary.length > 0, prompt.summary?.slice(0, 120))
+    check("no tool calls leaked to the client", prompt.tools === undefined && prompt.messages === undefined)
+    console.log(`      (${Math.round((Date.now() - started) / 1000)}s, ${prompt.durationMs}ms)`)
 
     const history = JSON.parse(
       text(
@@ -209,7 +211,7 @@ await withClient({ OPENCODE_URL: "", OPENCODE_PASSWORD: "" }, async (client) => 
       await client.callTool(
         {
           name: "opencode_task",
-          arguments: { directory: cwd, prompt: "Reply with exactly: delegated", agent: "general", timeoutMs: 180000 },
+          arguments: { directory: cwd, prompt: "Reply with exactly: delegated", agent: "general", timeoutMs: 180000, ...(MODEL ? { model: MODEL } : {}) },
         },
         undefined,
         { timeout: 200000 },
@@ -217,11 +219,42 @@ await withClient({ OPENCODE_URL: "", OPENCODE_PASSWORD: "" }, async (client) => 
     ),
   )
   check("task delegate returned", task.status === "idle" && task.agent === "general", JSON.stringify(task).slice(0, 200))
-  check("task has child transcript", Array.isArray(task.messages), `${task.messages?.length} messages`)
+  check("task returns only a summary", typeof task.summary === "string" && task.summary.length > 0, task.summary?.slice(0, 120))
+  check("task hides transcript by default", task.messages === undefined && task.tools === undefined)
   await client.callTool({ name: "opencode_session_delete", arguments: { sessionID: task.sessionID } }).catch(() => {})
 
+  const background = JSON.parse(
+    text(
+      await client.callTool(
+        {
+          name: "opencode_task",
+          arguments: {
+            directory: cwd,
+            prompt: "Reply with exactly: background-done",
+            agent: "general",
+            background: true,
+            ...(MODEL ? { model: MODEL } : {}),
+          },
+        },
+        undefined,
+        { timeout: 60000 },
+      ),
+    ),
+  )
+  check("background task acknowledges immediately", background.status === "working" && Boolean(background.jobID))
+  let job = background
+  for (let attempt = 0; attempt < 60 && job.status === "working"; attempt += 1) {
+    await new Promise((resolve) => setTimeout(resolve, 2000))
+    job = JSON.parse(
+      text(await client.callTool({ name: "opencode_job", arguments: { jobID: background.jobID } }, undefined, { timeout: 60000 })),
+    )
+  }
+  check("background job finishes", job.status === "done", JSON.stringify(job).slice(0, 200))
+  check("background job returns the summary", typeof job.summary === "string" && job.summary.length > 0, job.summary?.slice(0, 120))
+  await client.callTool({ name: "opencode_session_delete", arguments: { sessionID: background.sessionID } }).catch(() => {})
+
   const session = JSON.parse(
-    text(await client.callTool({ name: "opencode_session_create", arguments: { directory: cwd, title: "attachment test" } })),
+    text(await client.callTool({ name: "opencode_session_create", arguments: { directory: cwd, title: "attachment test", ...(MODEL ? { model: MODEL } : {}) } })),
   )
   const filePath = path.join(cwd, "scripts", "attachment-fixture.txt")
   const attached = JSON.parse(
@@ -238,7 +271,7 @@ await withClient({ OPENCODE_URL: "", OPENCODE_PASSWORD: "" }, async (client) => 
     ),
   )
   check("attachment uploaded", attached.ok === true && attached.attachment?.size > 0, JSON.stringify(attached).slice(0, 200))
-  check("attachment prompt answered", attached.result?.status === "idle", attached.result?.status)
+  check("attachment prompt answered", attached.result?.status === "idle" && Boolean(attached.result?.summary), attached.result?.status)
   await client.callTool({ name: "opencode_session_delete", arguments: { sessionID: session.sessionID } }).catch(() => {})
 })
 

@@ -15,6 +15,8 @@ const fileInput = z.object({
   description: z.string().optional(),
 })
 
+export type Verbosity = "summary" | "full"
+
 export function registerPromptTools(server: McpServer, ctx: ServerContext): void {
   register(
     server,
@@ -22,8 +24,9 @@ export function registerPromptTools(server: McpServer, ctx: ServerContext): void
     {
       title: "Prompt an OpenCode session",
       description:
-        "Send a message to a session and (by default) wait for the answer. " +
-        "Returns the assistant text, new turns, tool calls and usage. " +
+        "Send a message to a session and return the final answer. By default only a summary is returned: " +
+        "tool calls, intermediate steps and reasoning stay inside OpenCode, so the caller's context is not polluted. " +
+        "Set verbosity='full' only when you explicitly need the transcript. " +
         "Attach files with `files` (path or data: URI). Set wait=false for fire-and-forget.",
       inputSchema: {
         sessionID: z.string(),
@@ -32,11 +35,21 @@ export function registerPromptTools(server: McpServer, ctx: ServerContext): void
         agents: z.array(z.object({ name: z.string() })).optional().describe("Agents the model may delegate to"),
         skills: z.array(z.object({ id: z.string() })).optional(),
         wait: z.boolean().optional().describe("Wait for the run to finish (default true)"),
-        timeoutMs: z.number().int().min(1_000).max(3_600_000).optional().describe("Default 45000 (kept under typical MCP client timeouts)"),
+        timeoutMs: z
+          .number()
+          .int()
+          .min(1_000)
+          .max(3_600_000)
+          .optional()
+          .describe("Default 45000 (kept under typical MCP client timeouts)"),
+        verbosity: z
+          .enum(["summary", "full"])
+          .optional()
+          .describe("summary (default) returns only the final answer; full adds messages, tools and usage"),
       },
       annotations: { readOnlyHint: false },
     },
-    async (args) => executePrompt(ctx, args as unknown as PromptInput),
+    async (args, extra) => executePrompt(ctx, args as unknown as PromptInput, extra),
   )
 }
 
@@ -48,9 +61,10 @@ export interface PromptInput {
   skills?: Array<{ id: string }>
   wait?: boolean
   timeoutMs?: number
+  verbosity?: Verbosity
 }
 
-export async function executePrompt(ctx: ServerContext, input: PromptInput) {
+export async function executePrompt(ctx: ServerContext, input: PromptInput, extra?: unknown) {
   assertWritable(ctx, "sending prompts")
   if (!input.text?.trim() && !(input.files?.length ?? 0)) {
     throw invalidInput("Provide text and/or at least one file.")
@@ -63,40 +77,96 @@ export async function executePrompt(ctx: ServerContext, input: PromptInput) {
   const files = await Promise.all((input.files ?? []).map((file) => toAttachment(directory, file)))
   const startedAt = Date.now()
 
-  await client.session.prompt({
-    sessionID: input.sessionID,
-    text: input.text ?? "",
-    files,
-    agents: input.agents,
-    skills: input.skills,
-  })
+  const stopHeartbeat = startHeartbeat(extra)
+  try {
+    await client.session.prompt({
+      sessionID: input.sessionID,
+      text: input.text ?? "",
+      files,
+      agents: input.agents,
+      skills: input.skills,
+    })
 
-  const shouldWait = input.wait !== false
-  const status = shouldWait ? await waitForIdle(client, input.sessionID, input.timeoutMs ?? 45_000) : "running"
+    const shouldWait = input.wait !== false
+    const status = shouldWait ? await waitForIdle(client, input.sessionID, input.timeoutMs ?? 45_000) : "running"
 
-  const messages = await collectMessages(client, input.sessionID, startedAt)
-  const text = assistantText(messages)
-  const tools = toolCalls(messages)
-  const usage = usageFrom(messages)
+    const messages = await collectMessages(client, input.sessionID, startedAt)
+    const text = assistantText(messages)
+    const failure = failureFrom(messages)
+    const resolvedStatus = failure
+      ? "error"
+      : status === "idle" && messages.length === 0
+        ? "empty"
+        : status
+    const durationMs = Date.now() - startedAt
+    const summary = text.trim()
 
-  const resolvedStatus = status === "idle" && messages.length === 0 ? "empty" : status
-
-  return {
-    sessionID: input.sessionID,
-    status: resolvedStatus,
-    directory,
-    text,
-    messages: messages.map(renderMessage),
-    tools,
-    usage,
-    attachments: files.map((file) => ({ name: file.name, uri: previewUri(file.uri) })),
-    hint:
-      resolvedStatus === "idle"
+    const hint = failure
+      ? "The provider rejected the run. Fix the model/credential and retry; the session is still usable."
+      : resolvedStatus === "idle"
         ? undefined
         : resolvedStatus === "empty"
           ? "The provider returned no messages. The prompt may not have been delivered; retry, or inspect the session in the OpenCode TUI."
-          : "The run is still in progress. Poll opencode_session_history until it is idle, or call opencode_session_interrupt to stop it.",
+          : "The run is still in progress. Poll opencode_session_history until it is idle, or call opencode_session_interrupt to stop it."
+
+    if ((input.verbosity ?? "summary") === "summary") {
+      return {
+        sessionID: input.sessionID,
+        status: resolvedStatus,
+        summary,
+        durationMs,
+        ...(failure ? { error: failure } : {}),
+        ...(hint ? { hint } : {}),
+      }
+    }
+
+    return {
+      sessionID: input.sessionID,
+      status: resolvedStatus,
+      summary,
+      text,
+      durationMs,
+      messages: messages.map(renderMessage),
+      tools: toolCalls(messages),
+      usage: usageFrom(messages),
+      attachments: files.map((file) => ({ name: file.name, uri: previewUri(file.uri) })),
+      ...(failure ? { error: failure } : {}),
+      ...(hint ? { hint } : {}),
+    }
+  } finally {
+    stopHeartbeat()
   }
+}
+
+/**
+ * While the run is in flight, send generic "working" progress notifications. The messages are
+ * deliberately vague: no tool names, no intermediate output, no reasoning.
+ */
+function startHeartbeat(extra: unknown): () => void {
+  const anyExtra = extra as { _meta?: { progressToken?: string | number }; sendNotification?: (n: unknown) => Promise<unknown> } | undefined
+  const token = anyExtra?._meta?.progressToken
+  if (token === undefined || typeof anyExtra?.sendNotification !== "function") return () => {}
+
+  const started = Date.now()
+  let step = 0
+
+  const notify = (message: string) => {
+    step += 1
+    Promise.resolve(
+      anyExtra.sendNotification!({
+        method: "notifications/progress",
+        params: { progressToken: token, progress: step, message },
+      }),
+    ).catch(() => undefined)
+  }
+
+  notify("OpenCode is working…")
+  const timer = setInterval(() => {
+    notify(`OpenCode is working… ${Math.round((Date.now() - started) / 1000)}s`)
+  }, 5_000)
+  timer.unref?.()
+
+  return () => clearInterval(timer)
 }
 
 async function waitForIdle(client: OpenCodeClient, sessionID: string, timeoutMs: number): Promise<string> {
@@ -128,6 +198,21 @@ function assistantText(messages: any[]): string {
     .map((part: any) => part.text ?? "")
     .join("\n\n")
     .trim()
+}
+
+/** Surface provider failures instead of returning a silent empty summary. */
+function failureFrom(messages: any[]): { type: string; message: string } | undefined {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index]
+    const error = message?.error
+    if (error?.message) {
+      return { type: String(error.type ?? "provider.error"), message: String(error.message) }
+    }
+    if (message?.type === "assistant" && message.finish === "error") {
+      return { type: "provider.error", message: "The provider returned an error without details." }
+    }
+  }
+  return undefined
 }
 
 function toolCalls(messages: any[]) {

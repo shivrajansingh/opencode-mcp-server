@@ -17,6 +17,8 @@ if (!url || !password) {
   process.exit(1)
 }
 
+const MODEL = process.env.SMOKE_MODEL ? (([providerID, id]) => ({ providerID, id }))(process.env.SMOKE_MODEL.split("/")) : undefined
+
 const workspace = await fs.mkdtemp(path.join(os.tmpdir(), "opencode-agentic-"))
 let failures = 0
 const check = (name, condition, detail) => {
@@ -46,6 +48,7 @@ try {
   const task = await call("opencode_task", {
     directory: workspace,
     agent: "build",
+    ...(MODEL ? { model: MODEL } : {}),
     prompt:
       "Create a file named hello.txt in the current directory containing exactly the line: hello from opencode. " +
       "Then run `cat hello.txt` and report what you saw.",
@@ -55,11 +58,8 @@ try {
   console.log(`      finished in ${seconds}s`)
 
   check("run completed", task.status === "idle", task.status)
-  check("assistant produced text", typeof task.text === "string" && task.text.length > 0, task.text?.slice(0, 120))
-
-  const names = (task.tools ?? []).map((tool) => tool.name)
-  check("model called the write tool", names.includes("write"), names.join(","))
-  check("model called the shell tool", names.includes("shell") || names.includes("bash"), names.join(","))
+  check("summary returned, no transcript", typeof task.summary === "string" && task.summary.length > 0, task.summary?.slice(0, 120))
+  check("tool calls hidden from the client", task.tools === undefined && task.messages === undefined)
 
   const written = await fs.readFile(path.join(workspace, "hello.txt"), "utf8").catch(() => null)
   check("file exists on disk", written !== null, "hello.txt missing")

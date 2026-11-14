@@ -7,6 +7,7 @@ import { registerHistoryTools } from "./history.js"
 import { registerModelTools } from "./model.js"
 import { registerAgentTools } from "./agent.js"
 import { registerTaskTools } from "./task.js"
+import { registerJobTools } from "./job.js"
 import { registerFileTools } from "./files.js"
 import { registerMcpTools } from "./mcp.js"
 import { registerPermissionTools } from "./permission.js"
@@ -14,8 +15,8 @@ import { registerPermissionTools } from "./permission.js"
 export type ToolProfile = "full" | "minimal"
 
 /**
- * full    → 18 tools
- * minimal → 9 tools (status, configure, workspace, session create/prompt/history, model, task, permission)
+ * full    → 19 tools
+ * minimal → 10 tools (status, configure, workspace, session create/prompt/history, model, task, job, permission)
  */
 export function registerTools(server: McpServer, ctx: ServerContext, profile: ToolProfile = "full"): string[] {
   registerConfigTools(server, ctx)
@@ -25,6 +26,7 @@ export function registerTools(server: McpServer, ctx: ServerContext, profile: To
   registerModelTools(server, ctx)
   registerPermissionTools(server, ctx)
   registerTaskTools(server, ctx)
+  registerJobTools(server, ctx)
 
   if (profile === "full") {
     registerSessionAdminTools(server, ctx)
@@ -43,6 +45,7 @@ export function registerTools(server: McpServer, ctx: ServerContext, profile: To
     "opencode_model",
     "opencode_permission",
     "opencode_task",
+    "opencode_job",
   ]
   if (profile === "full") {
     names.push(

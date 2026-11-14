@@ -951,7 +951,7 @@ function registerPromptTools(server, ctx) {
     "opencode_session_prompt",
     {
       title: "Prompt an OpenCode session",
-      description: "Send a message to a session and (by default) wait for the answer. Returns the assistant text, new turns, tool calls and usage. Attach files with `files` (path or data: URI). Set wait=false for fire-and-forget.",
+      description: "Send a message to a session and return the final answer. By default only a summary is returned: tool calls, intermediate steps and reasoning stay inside OpenCode, so the caller's context is not polluted. Set verbosity='full' only when you explicitly need the transcript. Attach files with `files` (path or data: URI). Set wait=false for fire-and-forget.",
       inputSchema: {
         sessionID: z3.string(),
         text: z3.string().describe("The prompt text"),
@@ -959,14 +959,15 @@ function registerPromptTools(server, ctx) {
         agents: z3.array(z3.object({ name: z3.string() })).optional().describe("Agents the model may delegate to"),
         skills: z3.array(z3.object({ id: z3.string() })).optional(),
         wait: z3.boolean().optional().describe("Wait for the run to finish (default true)"),
-        timeoutMs: z3.number().int().min(1e3).max(36e5).optional().describe("Default 45000 (kept under typical MCP client timeouts)")
+        timeoutMs: z3.number().int().min(1e3).max(36e5).optional().describe("Default 45000 (kept under typical MCP client timeouts)"),
+        verbosity: z3.enum(["summary", "full"]).optional().describe("summary (default) returns only the final answer; full adds messages, tools and usage")
       },
       annotations: { readOnlyHint: false }
     },
-    async (args) => executePrompt(ctx, args)
+    async (args, extra) => executePrompt(ctx, args, extra)
   );
 }
-async function executePrompt(ctx, input) {
+async function executePrompt(ctx, input, extra) {
   assertWritable(ctx, "sending prompts");
   if (!input.text?.trim() && !(input.files?.length ?? 0)) {
     throw invalidInput("Provide text and/or at least one file.");
@@ -976,31 +977,73 @@ async function executePrompt(ctx, input) {
   const directory = session.location?.directory ?? (await workspaceFor(ctx)).directory;
   const files = await Promise.all((input.files ?? []).map((file) => toAttachment(directory, file)));
   const startedAt = Date.now();
-  await client.session.prompt({
-    sessionID: input.sessionID,
-    text: input.text ?? "",
-    files,
-    agents: input.agents,
-    skills: input.skills
-  });
-  const shouldWait = input.wait !== false;
-  const status = shouldWait ? await waitForIdle(client, input.sessionID, input.timeoutMs ?? 45e3) : "running";
-  const messages = await collectMessages(client, input.sessionID, startedAt);
-  const text = assistantText(messages);
-  const tools = toolCalls(messages);
-  const usage = usageFrom(messages);
-  const resolvedStatus = status === "idle" && messages.length === 0 ? "empty" : status;
-  return {
-    sessionID: input.sessionID,
-    status: resolvedStatus,
-    directory,
-    text,
-    messages: messages.map(renderMessage),
-    tools,
-    usage,
-    attachments: files.map((file) => ({ name: file.name, uri: previewUri(file.uri) })),
-    hint: resolvedStatus === "idle" ? void 0 : resolvedStatus === "empty" ? "The provider returned no messages. The prompt may not have been delivered; retry, or inspect the session in the OpenCode TUI." : "The run is still in progress. Poll opencode_session_history until it is idle, or call opencode_session_interrupt to stop it."
+  const stopHeartbeat = startHeartbeat(extra);
+  try {
+    await client.session.prompt({
+      sessionID: input.sessionID,
+      text: input.text ?? "",
+      files,
+      agents: input.agents,
+      skills: input.skills
+    });
+    const shouldWait = input.wait !== false;
+    const status = shouldWait ? await waitForIdle(client, input.sessionID, input.timeoutMs ?? 45e3) : "running";
+    const messages = await collectMessages(client, input.sessionID, startedAt);
+    const text = assistantText(messages);
+    const failure = failureFrom(messages);
+    const resolvedStatus = failure ? "error" : status === "idle" && messages.length === 0 ? "empty" : status;
+    const durationMs = Date.now() - startedAt;
+    const summary = text.trim();
+    const hint = failure ? "The provider rejected the run. Fix the model/credential and retry; the session is still usable." : resolvedStatus === "idle" ? void 0 : resolvedStatus === "empty" ? "The provider returned no messages. The prompt may not have been delivered; retry, or inspect the session in the OpenCode TUI." : "The run is still in progress. Poll opencode_session_history until it is idle, or call opencode_session_interrupt to stop it.";
+    if ((input.verbosity ?? "summary") === "summary") {
+      return {
+        sessionID: input.sessionID,
+        status: resolvedStatus,
+        summary,
+        durationMs,
+        ...failure ? { error: failure } : {},
+        ...hint ? { hint } : {}
+      };
+    }
+    return {
+      sessionID: input.sessionID,
+      status: resolvedStatus,
+      summary,
+      text,
+      durationMs,
+      messages: messages.map(renderMessage),
+      tools: toolCalls(messages),
+      usage: usageFrom(messages),
+      attachments: files.map((file) => ({ name: file.name, uri: previewUri(file.uri) })),
+      ...failure ? { error: failure } : {},
+      ...hint ? { hint } : {}
+    };
+  } finally {
+    stopHeartbeat();
+  }
+}
+function startHeartbeat(extra) {
+  const anyExtra = extra;
+  const token = anyExtra?._meta?.progressToken;
+  if (token === void 0 || typeof anyExtra?.sendNotification !== "function") return () => {
   };
+  const started = Date.now();
+  let step = 0;
+  const notify = (message) => {
+    step += 1;
+    Promise.resolve(
+      anyExtra.sendNotification({
+        method: "notifications/progress",
+        params: { progressToken: token, progress: step, message }
+      })
+    ).catch(() => void 0);
+  };
+  notify("OpenCode is working\u2026");
+  const timer = setInterval(() => {
+    notify(`OpenCode is working\u2026 ${Math.round((Date.now() - started) / 1e3)}s`);
+  }, 5e3);
+  timer.unref?.();
+  return () => clearInterval(timer);
 }
 async function waitForIdle(client, sessionID, timeoutMs) {
   const controller = new AbortController();
@@ -1024,6 +1067,19 @@ async function collectMessages(client, sessionID, since) {
 }
 function assistantText(messages) {
   return messages.filter((message) => message.type === "assistant").flatMap((message) => (message.content ?? []).filter((part) => part.type === "text")).map((part) => part.text ?? "").join("\n\n").trim();
+}
+function failureFrom(messages) {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    const error = message?.error;
+    if (error?.message) {
+      return { type: String(error.type ?? "provider.error"), message: String(error.message) };
+    }
+    if (message?.type === "assistant" && message.finish === "error") {
+      return { type: "provider.error", message: "The provider returned an error without details." };
+    }
+  }
+  return void 0;
 }
 function toolCalls(messages) {
   const out = [];
@@ -1428,12 +1484,69 @@ import { z as z7 } from "zod";
 
 // src/tools/task.ts
 import { z as z6 } from "zod";
+
+// src/jobs.ts
+import { randomUUID } from "crypto";
+var jobs = /* @__PURE__ */ new Map();
+var MAX_JOBS = 100;
+function createJob(init) {
+  prune();
+  const job = {
+    ...init,
+    id: `job_${randomUUID().replace(/-/g, "").slice(0, 20)}`,
+    status: "working",
+    startedAt: Date.now()
+  };
+  jobs.set(job.id, job);
+  return job;
+}
+function getJob(id) {
+  return jobs.get(id);
+}
+function listJobs(limit = 20) {
+  return [...jobs.values()].sort((a, b) => b.startedAt - a.startedAt).slice(0, limit);
+}
+function finishJob(id, patch) {
+  const job = jobs.get(id);
+  if (!job) return void 0;
+  job.status = patch.status;
+  job.summary = patch.summary;
+  job.error = patch.error;
+  job.finishedAt = Date.now();
+  return job;
+}
+function cancelJob(id, reason = "cancelled by client") {
+  return finishJob(id, { status: "cancelled", error: reason });
+}
+function prune() {
+  if (jobs.size < MAX_JOBS) return;
+  const finished = [...jobs.values()].filter((job) => job.status !== "working").sort((a, b) => (a.finishedAt ?? 0) - (b.finishedAt ?? 0));
+  while (jobs.size >= MAX_JOBS && finished.length > 0) {
+    const oldest = finished.shift();
+    jobs.delete(oldest.id);
+  }
+}
+function jobToJson(job) {
+  const durationMs = (job.finishedAt ?? Date.now()) - job.startedAt;
+  return {
+    jobID: job.id,
+    sessionID: job.sessionID,
+    status: job.status,
+    agent: job.agent ?? null,
+    elapsedMs: durationMs,
+    summary: job.status === "done" ? job.summary ?? "" : void 0,
+    error: job.status === "error" || job.status === "cancelled" ? job.error ?? job.status : void 0,
+    hint: job.status === "working" ? "OpenCode is still working. Call opencode_job again with this jobID to collect the summary." : void 0
+  };
+}
+
+// src/tools/task.ts
 var modelRef3 = z6.object({
   providerID: z6.string(),
   id: z6.string(),
   variant: z6.string().optional()
 });
-async function runTask(ctx, input) {
+async function runTask(ctx, input, extra) {
   assertWritable(ctx, "delegating tasks");
   const workspace = await workspaceFor(ctx, input.directory);
   const { client } = await openClient(ctx);
@@ -1444,20 +1557,77 @@ async function runTask(ctx, input) {
     model: input.model,
     parentID: input.parentSessionID
   });
-  const result = await executePrompt(ctx, {
-    sessionID: session.id,
-    text: input.prompt,
-    wait: input.wait,
-    timeoutMs: input.timeoutMs ?? 45e3
-  });
+  if (input.background) {
+    const job = createJob({
+      sessionID: session.id,
+      directory: workspace.directory,
+      agent: session.agent ?? input.agent,
+      title: session.title
+    });
+    void runInBackground(ctx, job.id, session.id, input);
+    return {
+      jobID: job.id,
+      sessionID: session.id,
+      status: "working",
+      agent: session.agent ?? input.agent ?? null,
+      hint: "OpenCode is working. Call opencode_job { action: 'status', jobID } to collect the final summary."
+    };
+  }
+  const result = await executePrompt(
+    ctx,
+    {
+      sessionID: session.id,
+      text: input.prompt,
+      wait: input.wait,
+      timeoutMs: input.timeoutMs ?? 45e3,
+      verbosity: input.verbosity
+    },
+    extra
+  );
+  if (input.verbosity === "full") {
+    return {
+      ...result,
+      sessionID: session.id,
+      parentSessionID: session.parentID ?? null,
+      directory: workspace.directory,
+      agent: session.agent,
+      model: session.model
+    };
+  }
   return {
-    ...result,
     sessionID: session.id,
     parentSessionID: session.parentID ?? null,
-    directory: workspace.directory,
-    agent: session.agent,
-    model: session.model
+    status: result.status,
+    summary: result.summary,
+    durationMs: result.durationMs,
+    agent: session.agent ?? input.agent ?? null,
+    ..."hint" in result && result.hint ? { hint: result.hint } : {}
   };
+}
+async function runInBackground(ctx, jobID, sessionID, input) {
+  try {
+    const result = await executePrompt(ctx, {
+      sessionID,
+      text: input.prompt,
+      wait: true,
+      timeoutMs: input.timeoutMs ?? 18e5,
+      verbosity: "summary"
+    });
+    if (result.status === "idle") {
+      finishJob(jobID, { status: "done", summary: result.summary });
+    } else if (result.status === "error" && "error" in result && result.error) {
+      finishJob(jobID, { status: "error", error: result.error.message });
+    } else if (result.status === "timeout" || result.status === "running") {
+      finishJob(jobID, {
+        status: "error",
+        error: "still running after the wait timeout; the session continues in OpenCode"
+      });
+    } else {
+      finishJob(jobID, { status: "error", error: result.hint ?? result.status });
+    }
+  } catch (error) {
+    finishJob(jobID, { status: "error", error: error instanceof Error ? error.message : String(error) });
+  }
 }
 function registerTaskTools(server, ctx) {
   register(
@@ -1465,7 +1635,7 @@ function registerTaskTools(server, ctx) {
     "opencode_task",
     {
       title: "Delegate a task to OpenCode",
-      description: "One-shot delegation: create a session in a workspace, send a prompt, wait for the result, and return the answer plus the subagent transcript. Use this for 'have OpenCode do X in this repo' requests; use opencode_session_* when you need a persistent conversation.",
+      description: "One-shot delegation: create a session, send a prompt, wait for the run, and return ONLY the final summary. Tool calls, intermediate steps and reasoning stay inside OpenCode, so the caller's context stays clean. Use background=true to get an immediate 'working' acknowledgement and collect the summary later with opencode_job. Set verbosity='full' only when a transcript is explicitly needed.",
       inputSchema: {
         directory: z6.string().optional().describe("Absolute workspace; defaults to the client's directory"),
         prompt: z6.string().describe("What the agent should do"),
@@ -1473,12 +1643,14 @@ function registerTaskTools(server, ctx) {
         title: z6.string().optional(),
         model: modelRef3.optional(),
         parentSessionID: z6.string().optional().describe("Attach the task as a subagent of this session"),
-        wait: z6.boolean().optional().describe("Default true"),
-        timeoutMs: z6.number().int().min(1e3).max(36e5).optional().describe("Default 45000")
+        wait: z6.boolean().optional().describe("Wait for the run (default true; ignored when background=true)"),
+        timeoutMs: z6.number().int().min(1e3).max(36e5).optional().describe("Default 45000 inline, 1800000 in background"),
+        verbosity: z6.enum(["summary", "full"]).optional().describe("Default summary"),
+        background: z6.boolean().optional().describe("Return immediately with a jobID instead of waiting")
       },
       annotations: { readOnlyHint: false }
     },
-    async (args) => runTask(ctx, args)
+    async (args, extra) => runTask(ctx, args, extra)
   );
 }
 
@@ -1536,10 +1708,47 @@ function registerAgentTools(server, ctx) {
   );
 }
 
+// src/tools/job.ts
+import { z as z8 } from "zod";
+function registerJobTools(server, ctx) {
+  register(
+    server,
+    "opencode_job",
+    {
+      title: "Background job status",
+      description: "Track tasks started with background=true. Returns only the final summary once the job is done \u2014 intermediate tool calls and thinking never leave OpenCode.",
+      inputSchema: {
+        action: z8.enum(["status", "list", "cancel"]).optional().describe("Default: status"),
+        jobID: z8.string().optional().describe("Required for status and cancel"),
+        limit: z8.number().int().min(1).max(100).optional()
+      },
+      annotations: { readOnlyHint: false }
+    },
+    async (args) => {
+      const action = args.action ?? "status";
+      if (action === "list") {
+        return { jobs: listJobs(args.limit ?? 20).map(jobToJson) };
+      }
+      if (!args.jobID) throw invalidInput(`action=${action} requires jobID`);
+      const job = getJob(args.jobID);
+      if (!job) throw invalidInput(`Unknown jobID ${args.jobID}`);
+      if (action === "cancel") {
+        if (job.status === "working") {
+          const { client } = await openClient(ctx);
+          await client.session.interrupt({ sessionID: job.sessionID }).catch(() => void 0);
+          cancelJob(job.id);
+        }
+        return jobToJson(getJob(job.id));
+      }
+      return jobToJson(job);
+    }
+  );
+}
+
 // src/tools/files.ts
 import { promises as fs7 } from "fs";
 import path6 from "path";
-import { z as z8 } from "zod";
+import { z as z9 } from "zod";
 var MAX_BYTES = 10 * 1024 * 1024;
 function registerFileTools(server, ctx) {
   register(
@@ -1549,14 +1758,14 @@ function registerFileTools(server, ctx) {
       title: "Attach a file to a session",
       description: "Upload a file into a session. Provide `path` (server-side file) or `data` (base64 bytes). When `text` is supplied the file is sent immediately as a prompt and the answer is returned; otherwise the attachment descriptor and stored path are returned for a later prompt.",
       inputSchema: {
-        sessionID: z8.string(),
-        path: z8.string().optional().describe("Absolute or workspace-relative path"),
-        data: z8.string().optional().describe("Base64-encoded file contents"),
-        name: z8.string().optional(),
-        mime: z8.string().optional(),
-        description: z8.string().optional(),
-        text: z8.string().optional().describe("Also send this prompt with the attachment"),
-        wait: z8.boolean().optional()
+        sessionID: z9.string(),
+        path: z9.string().optional().describe("Absolute or workspace-relative path"),
+        data: z9.string().optional().describe("Base64-encoded file contents"),
+        name: z9.string().optional(),
+        mime: z9.string().optional(),
+        description: z9.string().optional(),
+        text: z9.string().optional().describe("Also send this prompt with the attachment"),
+        wait: z9.boolean().optional()
       },
       annotations: { readOnlyHint: false }
     },
@@ -1619,19 +1828,19 @@ function registerFileTools(server, ctx) {
 }
 
 // src/tools/mcp.ts
-import { z as z9 } from "zod";
-var localConfig = z9.object({
-  type: z9.literal("local"),
-  command: z9.array(z9.string()),
-  cwd: z9.string().optional(),
-  environment: z9.record(z9.string(), z9.string()).optional(),
-  disabled: z9.boolean().optional()
+import { z as z10 } from "zod";
+var localConfig = z10.object({
+  type: z10.literal("local"),
+  command: z10.array(z10.string()),
+  cwd: z10.string().optional(),
+  environment: z10.record(z10.string(), z10.string()).optional(),
+  disabled: z10.boolean().optional()
 });
-var remoteConfig = z9.object({
-  type: z9.literal("remote"),
-  url: z9.string(),
-  headers: z9.record(z9.string(), z9.string()).optional(),
-  disabled: z9.boolean().optional()
+var remoteConfig = z10.object({
+  type: z10.literal("remote"),
+  url: z10.string(),
+  headers: z10.record(z10.string(), z10.string()).optional(),
+  disabled: z10.boolean().optional()
 });
 function registerMcpTools(server, ctx) {
   register(
@@ -1641,11 +1850,11 @@ function registerMcpTools(server, ctx) {
       title: "OpenCode MCP servers",
       description: "Inspect and manage the MCP servers that OpenCode itself uses (not this bridge). Actions: list (servers + connection status), resources (tool/resource catalog), add (local or remote), remove, connect, disconnect. Server enablement is global per OpenCode project; per-session tool filtering is done with session permissions.",
       inputSchema: {
-        action: z9.enum(["list", "resources", "add", "remove", "connect", "disconnect"]),
-        directory: z9.string().optional(),
-        server: z9.string().optional().describe("Server name, for add/remove/connect/disconnect"),
-        config: z9.union([localConfig, remoteConfig]).optional().describe("Server config for action=add"),
-        types: z9.array(z9.string()).optional().describe("Resource types for action=resources")
+        action: z10.enum(["list", "resources", "add", "remove", "connect", "disconnect"]),
+        directory: z10.string().optional(),
+        server: z10.string().optional().describe("Server name, for add/remove/connect/disconnect"),
+        config: z10.union([localConfig, remoteConfig]).optional().describe("Server config for action=add"),
+        types: z10.array(z10.string()).optional().describe("Resource types for action=resources")
       },
       annotations: { readOnlyHint: false }
     },
@@ -1691,7 +1900,7 @@ function registerMcpTools(server, ctx) {
 }
 
 // src/tools/permission.ts
-import { z as z10 } from "zod";
+import { z as z11 } from "zod";
 var PROFILES = {
   "danger-full-access": [{ action: "*", resource: "*", effect: "allow" }],
   "workspace-write": [
@@ -1715,13 +1924,13 @@ function registerPermissionTools(server, ctx) {
       title: "Permission requests",
       description: "Headless runs block when OpenCode asks for permission. Use action=list to see pending requests and action=reply to approve or reject them. action=policy reports the bridge profile, or applies its ruleset to a session (approximate: OpenCode evaluates rules in order, so profiles are best-effort).",
       inputSchema: {
-        action: z10.enum(["list", "reply", "policy"]),
-        directory: z10.string().optional(),
-        sessionID: z10.string().optional(),
-        requestID: z10.string().optional(),
-        decision: z10.enum(["once", "always", "reject"]).optional(),
-        message: z10.string().optional(),
-        profile: z10.enum(["read-only", "workspace-write", "danger-full-access"]).optional()
+        action: z11.enum(["list", "reply", "policy"]),
+        directory: z11.string().optional(),
+        sessionID: z11.string().optional(),
+        requestID: z11.string().optional(),
+        decision: z11.enum(["once", "always", "reject"]).optional(),
+        message: z11.string().optional(),
+        profile: z11.enum(["read-only", "workspace-write", "danger-full-access"]).optional()
       },
       annotations: { readOnlyHint: false }
     },
@@ -1786,6 +1995,7 @@ function registerTools(server, ctx, profile = "full") {
   registerModelTools(server, ctx);
   registerPermissionTools(server, ctx);
   registerTaskTools(server, ctx);
+  registerJobTools(server, ctx);
   if (profile === "full") {
     registerSessionAdminTools(server, ctx);
     registerAgentTools(server, ctx);
@@ -1801,7 +2011,8 @@ function registerTools(server, ctx, profile = "full") {
     "opencode_session_history",
     "opencode_model",
     "opencode_permission",
-    "opencode_task"
+    "opencode_task",
+    "opencode_job"
   ];
   if (profile === "full") {
     names.push(

@@ -2,6 +2,7 @@ import { z } from "zod"
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
 import { register, openClient, workspaceFor, assertWritable, type ServerContext } from "./shared.js"
 import { executePrompt } from "./prompt.js"
+import { createJob, finishJob } from "../jobs.js"
 
 const modelRef = z.object({
   providerID: z.string(),
@@ -18,10 +19,12 @@ export interface TaskInput {
   parentSessionID?: string
   wait?: boolean
   timeoutMs?: number
+  verbosity?: "summary" | "full"
+  background?: boolean
 }
 
-/** Create a session (optionally a child), run one prompt, return the transcript. */
-export async function runTask(ctx: ServerContext, input: TaskInput) {
+/** Create a session (optionally a child), run one prompt, return the summary. */
+export async function runTask(ctx: ServerContext, input: TaskInput, extra?: unknown) {
   assertWritable(ctx, "delegating tasks")
   const workspace = await workspaceFor(ctx, input.directory)
   const { client } = await openClient(ctx)
@@ -34,20 +37,80 @@ export async function runTask(ctx: ServerContext, input: TaskInput) {
     parentID: input.parentSessionID,
   })
 
-  const result = await executePrompt(ctx, {
-    sessionID: session.id,
-    text: input.prompt,
-    wait: input.wait,
-    timeoutMs: input.timeoutMs ?? 45_000,
-  })
+  if (input.background) {
+    const job = createJob({
+      sessionID: session.id,
+      directory: workspace.directory,
+      agent: session.agent ?? input.agent,
+      title: session.title,
+    })
+    void runInBackground(ctx, job.id, session.id, input)
+    return {
+      jobID: job.id,
+      sessionID: session.id,
+      status: "working",
+      agent: session.agent ?? input.agent ?? null,
+      hint: "OpenCode is working. Call opencode_job { action: 'status', jobID } to collect the final summary.",
+    }
+  }
+
+  const result = await executePrompt(
+    ctx,
+    {
+      sessionID: session.id,
+      text: input.prompt,
+      wait: input.wait,
+      timeoutMs: input.timeoutMs ?? 45_000,
+      verbosity: input.verbosity,
+    },
+    extra,
+  )
+
+  if (input.verbosity === "full") {
+    return {
+      ...result,
+      sessionID: session.id,
+      parentSessionID: session.parentID ?? null,
+      directory: workspace.directory,
+      agent: session.agent,
+      model: session.model,
+    }
+  }
 
   return {
-    ...result,
     sessionID: session.id,
     parentSessionID: session.parentID ?? null,
-    directory: workspace.directory,
-    agent: session.agent,
-    model: session.model,
+    status: result.status,
+    summary: result.summary,
+    durationMs: result.durationMs,
+    agent: session.agent ?? input.agent ?? null,
+    ...("hint" in result && result.hint ? { hint: result.hint } : {}),
+  }
+}
+
+async function runInBackground(ctx: ServerContext, jobID: string, sessionID: string, input: TaskInput): Promise<void> {
+  try {
+    const result = await executePrompt(ctx, {
+      sessionID,
+      text: input.prompt,
+      wait: true,
+      timeoutMs: input.timeoutMs ?? 1_800_000,
+      verbosity: "summary",
+    })
+    if (result.status === "idle") {
+      finishJob(jobID, { status: "done", summary: result.summary })
+    } else if (result.status === "error" && "error" in result && result.error) {
+      finishJob(jobID, { status: "error", error: result.error.message })
+    } else if (result.status === "timeout" || result.status === "running") {
+      finishJob(jobID, {
+        status: "error",
+        error: "still running after the wait timeout; the session continues in OpenCode",
+      })
+    } else {
+      finishJob(jobID, { status: "error", error: result.hint ?? result.status })
+    }
+  } catch (error) {
+    finishJob(jobID, { status: "error", error: error instanceof Error ? error.message : String(error) })
   }
 }
 
@@ -58,9 +121,10 @@ export function registerTaskTools(server: McpServer, ctx: ServerContext): void {
     {
       title: "Delegate a task to OpenCode",
       description:
-        "One-shot delegation: create a session in a workspace, send a prompt, wait for the result, and return " +
-        "the answer plus the subagent transcript. Use this for 'have OpenCode do X in this repo' requests; " +
-        "use opencode_session_* when you need a persistent conversation.",
+        "One-shot delegation: create a session, send a prompt, wait for the run, and return ONLY the final summary. " +
+        "Tool calls, intermediate steps and reasoning stay inside OpenCode, so the caller's context stays clean. " +
+        "Use background=true to get an immediate 'working' acknowledgement and collect the summary later with opencode_job. " +
+        "Set verbosity='full' only when a transcript is explicitly needed.",
       inputSchema: {
         directory: z.string().optional().describe("Absolute workspace; defaults to the client's directory"),
         prompt: z.string().describe("What the agent should do"),
@@ -68,11 +132,19 @@ export function registerTaskTools(server: McpServer, ctx: ServerContext): void {
         title: z.string().optional(),
         model: modelRef.optional(),
         parentSessionID: z.string().optional().describe("Attach the task as a subagent of this session"),
-        wait: z.boolean().optional().describe("Default true"),
-        timeoutMs: z.number().int().min(1_000).max(3_600_000).optional().describe("Default 45000"),
+        wait: z.boolean().optional().describe("Wait for the run (default true; ignored when background=true)"),
+        timeoutMs: z
+          .number()
+          .int()
+          .min(1_000)
+          .max(3_600_000)
+          .optional()
+          .describe("Default 45000 inline, 1800000 in background"),
+        verbosity: z.enum(["summary", "full"]).optional().describe("Default summary"),
+        background: z.boolean().optional().describe("Return immediately with a jobID instead of waiting"),
       },
       annotations: { readOnlyHint: false },
     },
-    async (args) => runTask(ctx, args as TaskInput),
+    async (args, extra) => runTask(ctx, args as TaskInput, extra),
   )
 }

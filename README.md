@@ -97,7 +97,7 @@ disk unless you pass `persist: true`.
 `runtime (opencode_configure)` → `environment` → `~/.config/opencode-mcp/config.json` → unconfigured.
 There is no silent auto-discovery; `--discover` exists for development only.
 
-## Tools (18)
+## Tools (19)
 
 | Tool | What it does |
 |---|---|
@@ -115,13 +115,14 @@ There is no silent auto-discovery; `--discover` exists for development only.
 | `opencode_session_history` | Messages as JSON or markdown transcript. |
 | `opencode_model` | List models, read the default, assign at session/project/global/agent scope. |
 | `opencode_agent` | List agents, switch agent, delegate to a subagent. |
-| `opencode_task` | One-shot delegation: create session → prompt → wait → return transcript. |
+| `opencode_task` | One-shot delegation: create session → prompt → wait → return **summary only**. `background: true` returns a jobID immediately. |
+| `opencode_job` | Collect the summary of a background task (`status` / `list` / `cancel`). |
 | `opencode_file_attach` | Attach a path or base64 bytes to a session (optionally prompt immediately). |
 | `opencode_mcp` | Inspect/add/connect/remove OpenCode's own MCP servers. |
 | `opencode_permission` | List/reply to permission requests (required for headless runs). |
 
-`--profile minimal` registers 9 tools: status, configure, workspace, session create/prompt/history,
-model, task, permission.
+`--profile minimal` registers 10 tools: status, configure, workspace, session create/prompt/history,
+model, task, job, permission.
 
 ## Model assignment
 
@@ -154,42 +155,63 @@ A model can also be passed at creation time: `opencode_session_create({ model: {
 
 ## How a client actually runs OpenCode
 
-There are two entry points, both of which hand real work to OpenCode:
-
-**1. Persistent session** — the chat keeps going:
+The orchestrator assigns work; OpenCode does it; **only the final summary crosses the MCP boundary**.
 
 ```js
-opencode_session_create({ directory })
-opencode_session_prompt({ sessionID, text: "Fix the failing test in src/auth.ts" })
-// → OpenCode's own agent (build) runs the model, edits files, runs commands, and returns the answer
-```
-
-**2. One-shot delegation** — "do this task and give me the result":
-
-```js
-opencode_task({
+// one-shot delegation (recommended for orchestrators)
+const r = await opencode_task({
   directory: "/repo",
-  agent: "build",            // or plan / general / explore
-  prompt: "Create hello.txt with 'hello from opencode', then cat it",
-  timeoutMs: 250000
+  agent: "build",
+  prompt: "Add a /health endpoint and run the tests",
 })
+// → { status: "idle", summary: "Added /health … all 42 tests pass", durationMs: 18342 }
 ```
 
-`opencode_task` creates the session, sends the prompt, waits for the run to finish, and returns the
-assistant text, every tool call (`write`, `shell`, …), token/cost usage, and the child `sessionID`.
-Subagents work the same way: pass `agent: "explore"` or `parentSessionID` to attach the run as a child.
+While the run is in flight the client sees a generic progress message (`OpenCode is working… 12s`),
+never tool calls, intermediate output, or reasoning.
 
-The MCP client never touches the model. It sends text; OpenCode does inference through its own
-providers, runs the agentic loop with its own tools and permissions, and the bridge only translates
-the request/response. That means the client gets OpenCode's tools, MCP servers, skills, and models
-for free.
+For long tasks, return immediately and collect the result later:
+
+```js
+const { jobID } = await opencode_task({ directory, prompt, background: true })
+// → { jobID: "job_…", status: "working" }
+
+const job = await opencode_job({ jobID })
+// → { status: "working" }  … later …
+// → { status: "done", summary: "…" }
+```
+
+**Persistent conversations** work the same way:
+
+```js
+const s = await opencode_session_create({ directory })
+await opencode_session_prompt({ sessionID: s.sessionID, text: "Fix the failing test" })
+// → { status: "idle", summary: "Fixed the import in src/auth.ts …" }
+```
+
+### What is hidden, and how to opt out
+
+| Data | Default | Opt-in |
+|---|---|---|
+| Tool calls (`write`, `shell`, …) | hidden | `verbosity: "full"` |
+| Intermediate assistant turns | hidden | `verbosity: "full"` |
+| Reasoning blocks | never returned by prompt/task | `opencode_session_history { includeReasoning: true }` |
+| Token/cost usage | hidden | `verbosity: "full"` |
+| Provider errors | **always surfaced** as `status: "error"` + `error.message` | — |
+
+`opencode_session_history` remains the explicit audit tool: it is the only place tool calls are
+readable, and only when a client asks for them.
+
+The MCP client never touches the model. OpenCode runs inference through its own providers and runs
+the agentic loop with its own tools, skills, MCP servers and permissions; the bridge translates
+requests and returns summaries.
 
 If OpenCode asks for permission mid-run, the run blocks; use `opencode_permission { action: "list" }`
 and `{ action: "reply" }` to approve or reject headlessly.
 
 **Verified end to end:** `npm run agentic-smoke` asks the `build` agent to write a file and run
-`cat`, then asserts the file exists on disk with the right content and that `write` + `shell` appear
-in the transcript.
+`cat`, asserts the file exists on disk, and asserts the response contains **no** tool calls or
+messages.
 
 ## Workspace resolution
 
@@ -230,15 +252,17 @@ npm install
 npm run typecheck
 npm test              # unit tests (vitest)
 npm run build
-OPENCODE_URL=… OPENCODE_PASSWORD=… npm run smoke   # live end-to-end (stdio)
+# live tests need a working model; pass SMOKE_MODEL if the default is rate-limited
+SMOKE_MODEL=opencode-go/hy4 OPENCODE_URL=… OPENCODE_PASSWORD=… npm run smoke
+SMOKE_MODEL=opencode-go/hy4 OPENCODE_URL=… OPENCODE_PASSWORD=… npm run agentic-smoke
 node scripts/http-smoke.mjs                        # live end-to-end (HTTP, after starting --http)
 ```
 
 ## Status
 
-Working: all 18 tools, stdio + HTTP transports, config/status/configure, workspace resolution,
-model assignment at session/project/global/agent scope, attachments, delegation, compaction,
-permissions, MCP administration.
+Working: all 19 tools, stdio + HTTP transports, config/status/configure, workspace resolution,
+model assignment at session/project/global/agent scope, summary-only task output with background
+jobs, attachments, delegation, compaction, permissions, MCP administration.
 
 Not yet implemented from `docs/plan.md`: audit log file, OS keychain storage, artifact resources
 (`opencode://…`), progress notifications, and per-client smoke tests against Codex/Anti-Gravity.
