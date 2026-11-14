@@ -1,0 +1,58 @@
+{
+  "name": "opencode-mcp-server",
+  "version": "0.1.0",
+  "description": "MCP server that exposes an OpenCode v2 instance (sessions, inference, agents, files, MCP, history) to any MCP client.",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/shivrajansingh/opencode-mcp-server.git"
+  },
+  "homepage": "https://github.com/shivrajansingh/opencode-mcp-server#readme",
+  "bugs": {
+    "url": "https://github.com/shivrajansingh/opencode-mcp-server/issues"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "opencode",
+    "ai",
+    "agent",
+    "claude",
+    "codex"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "opencode-mcp-server": "dist/index.js",
+    "opencode-mcp": "dist/index.js"
+  },
+  "main": "dist/index.js",
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "smoke": "node scripts/smoke.mjs",
+    "agentic-smoke": "node scripts/agentic-smoke.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.2",
+    "@opencode/client": "^2.3.0",
+    "jsonc-parser": "^3.3.1",
+    "zod": "^4.6.7"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "tsup": "^8.5.0",
+    "typescript": "^5.9.0",
+    "vitest": "^3.2.0"
+  }
+}

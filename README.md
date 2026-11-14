@@ -1,0 +1,244 @@
+# opencode-mcp-server
+
+An MCP server that exposes a running **OpenCode v2** instance to any MCP client — Codex, Claude Code,
+Claude Desktop, Anti-Gravity, Cursor, or your own agent. Sessions, inference, agents, files, MCP
+servers and history all become tools in the client's chat.
+
+The bridge does not reimplement anything: it translates MCP tool calls into OpenCode v2 API calls
+through the official `@opencode/client` SDK.
+
+```
+Codex / Claude / Anti-Gravity  ──MCP──▶  opencode-mcp-server  ──@opencode/client──▶  OpenCode v2 (:4096)
+```
+
+## Requirements
+
+- Node.js ≥ 20
+- A running OpenCode **v2** server (`opencode serve`, or the TUI) — v1 is rejected on purpose
+- The server address and password (username is always `opencode`)
+
+## Setup
+
+The bridge needs two values:
+
+```
+OPENCODE_URL       e.g. http://127.0.0.1:4096
+OPENCODE_PASSWORD  the OpenCode Basic-auth password
+```
+
+Find the password in `~/.config/opencode/service.json` (or `~/.local/state/opencode/service.json`).
+
+### Install / run
+
+No npm release required — this runs straight from GitHub:
+
+```sh
+npx -y github:shivrajansingh/opencode-mcp-server --help
+```
+
+Pin to a release or commit for stability: `github:shivrajansingh/opencode-mcp-server#v0.1.0`.
+
+### Option A — configure once, from the terminal
+
+```sh
+npx -y github:shivrajansingh/opencode-mcp-server configure --url http://127.0.0.1:4096
+# prompts for the password without echoing it, validates it, writes ~/.config/opencode-mcp/config.json (0600)
+```
+
+Check it:
+
+```sh
+npx -y github:shivrajansingh/opencode-mcp-server status
+```
+
+### Option B — configure in the MCP client
+
+```toml
+# ~/.codex/config.toml
+[mcp_servers.opencode]
+command = "npx"
+args = ["-y", "github:shivrajansingh/opencode-mcp-server"]
+env = { OPENCODE_URL = "http://127.0.0.1:4096", OPENCODE_PASSWORD = "…" }
+```
+
+```sh
+# Claude Code
+claude mcp add opencode -e OPENCODE_URL=http://127.0.0.1:4096 -e OPENCODE_PASSWORD=… \
+  -- npx -y github:shivrajansingh/opencode-mcp-server
+```
+
+```json
+// Claude Desktop / Anti-Gravity MCP config
+{
+  "mcpServers": {
+    "opencode": {
+      "command": "npx",
+      "args": ["-y", "github:shivrajansingh/opencode-mcp-server"],
+      "env": { "OPENCODE_URL": "http://127.0.0.1:4096", "OPENCODE_PASSWORD": "…" }
+    }
+  }
+}
+```
+
+### Option C — configure from the chat
+
+Start the server with no credentials. It still lists its tools and `opencode_status` explains what is
+missing. Then ask the model to call:
+
+```json
+opencode_configure({ "url": "http://127.0.0.1:4096", "password": "…" })
+```
+
+Values are validated before they are applied, the password is never echoed, and nothing is written to
+disk unless you pass `persist: true`.
+
+### Precedence
+
+`runtime (opencode_configure)` → `environment` → `~/.config/opencode-mcp/config.json` → unconfigured.
+There is no silent auto-discovery; `--discover` exists for development only.
+
+## Tools (18)
+
+| Tool | What it does |
+|---|---|
+| `opencode_status` | Health, version, workspace, agents, default model. Works while unconfigured. |
+| `opencode_configure` | Validate and apply URL + password in-chat. |
+| `opencode_workspace` | Show/persist the working directory, list MCP roots. |
+| `opencode_session_create` | New session in a directory (agent, model, parent, permissions). |
+| `opencode_session_list` | List sessions by directory/search/archive/parent. |
+| `opencode_session_get` | Session metadata, tokens, cost. |
+| `opencode_session_move` | Change a session's directory. |
+| `opencode_session_delete` | Delete a session. |
+| `opencode_session_interrupt` | Stop the current run. |
+| `opencode_session_compact` | Summarize history to free context. |
+| `opencode_session_prompt` | Prompt with text + files, wait for the answer, return tools/usage. |
+| `opencode_session_history` | Messages as JSON or markdown transcript. |
+| `opencode_model` | List models, read the default, assign at session/project/global/agent scope. |
+| `opencode_agent` | List agents, switch agent, delegate to a subagent. |
+| `opencode_task` | One-shot delegation: create session → prompt → wait → return transcript. |
+| `opencode_file_attach` | Attach a path or base64 bytes to a session (optionally prompt immediately). |
+| `opencode_mcp` | Inspect/add/connect/remove OpenCode's own MCP servers. |
+| `opencode_permission` | List/reply to permission requests (required for headless runs). |
+
+`--profile minimal` registers 9 tools: status, configure, workspace, session create/prompt/history,
+model, task, permission.
+
+## Model assignment
+
+Four levels, all through `opencode_model`:
+
+| Scope | Call | Effect | Storage |
+|---|---|---|---|
+| **Session** | `{ action:"set", sessionID, model }` | immediate switch for that conversation | OpenCode DB |
+| **Project** | `{ action:"set", scope:"project", directory, model }` | default for new sessions in that workspace | `opencode.json` (comments preserved) |
+| **Global** | `{ action:"set", scope:"global", model }` | default everywhere | `~/.config/opencode/opencode.json` |
+| **Agent** | `{ action:"set", scope:"agent", agent:"build", model }` | model for that agent's runs | `agents.<id>.model` in the nearest config |
+
+Precedence: session → agent → project → global. `scope` defaults to `session` when `sessionID` is
+given, otherwise `project`.
+
+Project/global writes use a JSONC-aware editor (comments and unrelated keys survive), then trigger an
+OpenCode config reload and verify the result against `model/default`. Agent-level writes are verified
+by reading the file back, because OpenCode does not expose the resolved per-agent model through the
+API.
+
+```jsonc
+// opencode.json
+{
+  "model": { "providerID": "opencode", "model": "iceman-free" },
+  "agents": { "build": { "model": { "providerID": "opencode", "model": "inkling-2-small-free" } } }
+}
+```
+
+A model can also be passed at creation time: `opencode_session_create({ model: { providerID, id, variant? } })`.
+
+## How a client actually runs OpenCode
+
+There are two entry points, both of which hand real work to OpenCode:
+
+**1. Persistent session** — the chat keeps going:
+
+```js
+opencode_session_create({ directory })
+opencode_session_prompt({ sessionID, text: "Fix the failing test in src/auth.ts" })
+// → OpenCode's own agent (build) runs the model, edits files, runs commands, and returns the answer
+```
+
+**2. One-shot delegation** — "do this task and give me the result":
+
+```js
+opencode_task({
+  directory: "/repo",
+  agent: "build",            // or plan / general / explore
+  prompt: "Create hello.txt with 'hello from opencode', then cat it",
+  timeoutMs: 250000
+})
+```
+
+`opencode_task` creates the session, sends the prompt, waits for the run to finish, and returns the
+assistant text, every tool call (`write`, `shell`, …), token/cost usage, and the child `sessionID`.
+Subagents work the same way: pass `agent: "explore"` or `parentSessionID` to attach the run as a child.
+
+The MCP client never touches the model. It sends text; OpenCode does inference through its own
+providers, runs the agentic loop with its own tools and permissions, and the bridge only translates
+the request/response. That means the client gets OpenCode's tools, MCP servers, skills, and models
+for free.
+
+If OpenCode asks for permission mid-run, the run blocks; use `opencode_permission { action: "list" }`
+and `{ action: "reply" }` to approve or reject headlessly.
+
+**Verified end to end:** `npm run agentic-smoke` asks the `build` agent to write a file and run
+`cat`, then asserts the file exists on disk with the right content and that `write` + `shell` appear
+in the transcript.
+
+## Workspace resolution
+
+Sessions are created in, in order: the tool's `directory` argument → MCP `roots` → `CLAUDE_PROJECT_DIR` /
+`OPENCODE_MCP_DIRECTORY` / `INIT_CWD` → configured `defaultDirectory` → process cwd. The home directory
+and `/` are never used as a silent fallback; the bridge returns an actionable error instead.
+
+## HTTP transport
+
+```sh
+OPENCODE_MCP_TOKEN=… npx opencode-mcp-server --http --port 7777
+# POST http://127.0.0.1:7777/mcp  with  Authorization: Bearer <token>
+```
+
+If `OPENCODE_MCP_TOKEN` is unset, a token is generated at `~/.config/opencode-mcp/http-token` (0600).
+Health check: `GET /healthz`. The same token protects a settings endpoint:
+
+```sh
+curl -X POST http://127.0.0.1:7777/configure \
+  -H "Authorization: Bearer $OPENCODE_MCP_TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"url":"http://127.0.0.1:4096","password":"…"}'
+```
+
+## Security notes
+
+- The bridge can run an agent with shell access — treat it as remote code execution by design.
+- Loopback binding, bearer token, and loopback-only OpenCode URLs by default.
+- `--read-only` disables prompts, compaction, deletes, moves, uploads and permission replies.
+- `allowedRoots` (config file or `OPENCODE_MCP_ALLOWED_ROOTS`) blocks path escapes, symlink-safe.
+- Passwords never appear in logs, errors, or tool output; the audit-friendly paths redact them.
+- `opencode_configure` cannot change `allowedRoots` or the permission profile.
+
+## Development
+
+```sh
+npm install
+npm run typecheck
+npm test              # unit tests (vitest)
+npm run build
+OPENCODE_URL=… OPENCODE_PASSWORD=… npm run smoke   # live end-to-end (stdio)
+node scripts/http-smoke.mjs                        # live end-to-end (HTTP, after starting --http)
+```
+
+## Status
+
+Working: all 18 tools, stdio + HTTP transports, config/status/configure, workspace resolution,
+model assignment at session/project/global/agent scope, attachments, delegation, compaction,
+permissions, MCP administration.
+
+Not yet implemented from `docs/plan.md`: audit log file, OS keychain storage, artifact resources
+(`opencode://…`), progress notifications, and per-client smoke tests against Codex/Anti-Gravity.
