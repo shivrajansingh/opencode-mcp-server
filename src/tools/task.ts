@@ -1,7 +1,7 @@
 import { z } from "zod"
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
 import { register, openClient, workspaceFor, assertWritable, type ServerContext } from "./shared.js"
-import { executePrompt } from "./prompt.js"
+import { executePrompt, waitForSummary } from "./prompt.js"
 import { createJob, finishJob } from "../jobs.js"
 
 const modelRef = z.object({
@@ -54,6 +54,7 @@ export async function runTask(ctx: ServerContext, input: TaskInput, extra?: unkn
     }
   }
 
+  const startedAt = Date.now()
   const result = await executePrompt(
     ctx,
     {
@@ -77,6 +78,28 @@ export async function runTask(ctx: ServerContext, input: TaskInput, extra?: unkn
     }
   }
 
+  // The caller's wait elapsed but OpenCode is still working: keep going in the background so the
+  // summary is not lost, and hand back a jobID.
+  if (result.status === "timeout" && input.wait !== false) {
+    const job = createJob({
+      sessionID: session.id,
+      directory: workspace.directory,
+      agent: session.agent ?? input.agent,
+      title: session.title,
+    })
+    void continueInBackground(ctx, job.id, session.id, startedAt)
+    return {
+      sessionID: session.id,
+      parentSessionID: session.parentID ?? null,
+      status: "working",
+      jobID: job.id,
+      summary: "",
+      durationMs: result.durationMs,
+      agent: session.agent ?? input.agent ?? null,
+      hint: "OpenCode is still working. Call opencode_job { action: 'status', jobID } to collect the summary.",
+    }
+  }
+
   return {
     sessionID: session.id,
     parentSessionID: session.parentID ?? null,
@@ -85,6 +108,29 @@ export async function runTask(ctx: ServerContext, input: TaskInput, extra?: unkn
     durationMs: result.durationMs,
     agent: session.agent ?? input.agent ?? null,
     ...("hint" in result && result.hint ? { hint: result.hint } : {}),
+  }
+}
+
+async function continueInBackground(
+  ctx: ServerContext,
+  jobID: string,
+  sessionID: string,
+  since: number,
+): Promise<void> {
+  try {
+    const result = await waitForSummary(ctx, sessionID, since, 1_800_000)
+    if (result.status === "idle") {
+      finishJob(jobID, { status: "done", summary: result.summary })
+    } else if (result.status === "error" && result.error) {
+      finishJob(jobID, { status: "error", error: result.error.message })
+    } else {
+      finishJob(jobID, {
+        status: "error",
+        error: result.status === "empty" ? "no output from the provider" : "still running after 30 minutes",
+      })
+    }
+  } catch (error) {
+    finishJob(jobID, { status: "error", error: error instanceof Error ? error.message : String(error) })
   }
 }
 

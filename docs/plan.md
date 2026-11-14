@@ -290,6 +290,8 @@ side-table `sessionID → { directory, configuredAt, toolset }` for fast policy 
 - `background: true` creates an in-memory job and returns `{ jobID, status: "working" }` immediately;
   `opencode_job` returns `{ status: "done", summary }` once finished. Jobs are process-local (lost on
   restart) and capped at 100.
+- An **inline** task that exceeds its wait is automatically continued as a job: the response is
+  `{ status: "working", jobID }`, so the summary is never lost when the client's timeout fires.
 - Provider failures are surfaced as `status: "error"` with `error.type`/`error.message`, never as a
   silent empty summary.
 - When the wait elapses the tool returns `status: "timeout"` (or `"running"` with `wait: false`) plus a

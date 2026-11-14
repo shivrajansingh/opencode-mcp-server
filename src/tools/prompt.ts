@@ -139,6 +139,28 @@ export async function executePrompt(ctx: ServerContext, input: PromptInput, extr
 }
 
 /**
+ * Wait for a session to become idle and build the same summary shape as executePrompt.
+ * Used when an inline task exceeds the caller's timeout: the run keeps going and the summary is
+ * collected in the background instead of being lost.
+ */
+export async function waitForSummary(
+  ctx: ServerContext,
+  sessionID: string,
+  since: number,
+  timeoutMs: number,
+): Promise<{ status: string; summary: string; error?: { type: string; message: string } }> {
+  const { client } = await openClient(ctx)
+  const status = await waitForIdle(client, sessionID, timeoutMs)
+  const messages = await collectMessages(client, sessionID, since)
+  const failure = failureFrom(messages)
+  return {
+    status: failure ? "error" : status === "idle" && messages.length === 0 ? "empty" : status,
+    summary: assistantText(messages),
+    ...(failure ? { error: failure } : {}),
+  }
+}
+
+/**
  * While the run is in flight, send generic "working" progress notifications. The messages are
  * deliberately vague: no tool names, no intermediate output, no reasoning.
  */

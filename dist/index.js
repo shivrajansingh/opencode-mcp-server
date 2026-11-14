@@ -1022,6 +1022,17 @@ async function executePrompt(ctx, input, extra) {
     stopHeartbeat();
   }
 }
+async function waitForSummary(ctx, sessionID, since, timeoutMs) {
+  const { client } = await openClient(ctx);
+  const status = await waitForIdle(client, sessionID, timeoutMs);
+  const messages = await collectMessages(client, sessionID, since);
+  const failure = failureFrom(messages);
+  return {
+    status: failure ? "error" : status === "idle" && messages.length === 0 ? "empty" : status,
+    summary: assistantText(messages),
+    ...failure ? { error: failure } : {}
+  };
+}
 function startHeartbeat(extra) {
   const anyExtra = extra;
   const token = anyExtra?._meta?.progressToken;
@@ -1573,6 +1584,7 @@ async function runTask(ctx, input, extra) {
       hint: "OpenCode is working. Call opencode_job { action: 'status', jobID } to collect the final summary."
     };
   }
+  const startedAt = Date.now();
   const result = await executePrompt(
     ctx,
     {
@@ -1594,6 +1606,25 @@ async function runTask(ctx, input, extra) {
       model: session.model
     };
   }
+  if (result.status === "timeout" && input.wait !== false) {
+    const job = createJob({
+      sessionID: session.id,
+      directory: workspace.directory,
+      agent: session.agent ?? input.agent,
+      title: session.title
+    });
+    void continueInBackground(ctx, job.id, session.id, startedAt);
+    return {
+      sessionID: session.id,
+      parentSessionID: session.parentID ?? null,
+      status: "working",
+      jobID: job.id,
+      summary: "",
+      durationMs: result.durationMs,
+      agent: session.agent ?? input.agent ?? null,
+      hint: "OpenCode is still working. Call opencode_job { action: 'status', jobID } to collect the summary."
+    };
+  }
   return {
     sessionID: session.id,
     parentSessionID: session.parentID ?? null,
@@ -1603,6 +1634,23 @@ async function runTask(ctx, input, extra) {
     agent: session.agent ?? input.agent ?? null,
     ..."hint" in result && result.hint ? { hint: result.hint } : {}
   };
+}
+async function continueInBackground(ctx, jobID, sessionID, since) {
+  try {
+    const result = await waitForSummary(ctx, sessionID, since, 18e5);
+    if (result.status === "idle") {
+      finishJob(jobID, { status: "done", summary: result.summary });
+    } else if (result.status === "error" && result.error) {
+      finishJob(jobID, { status: "error", error: result.error.message });
+    } else {
+      finishJob(jobID, {
+        status: "error",
+        error: result.status === "empty" ? "no output from the provider" : "still running after 30 minutes"
+      });
+    }
+  } catch (error) {
+    finishJob(jobID, { status: "error", error: error instanceof Error ? error.message : String(error) });
+  }
 }
 async function runInBackground(ctx, jobID, sessionID, input) {
   try {
@@ -2031,7 +2079,7 @@ function registerTools(server, ctx, profile = "full") {
 }
 
 // src/index.ts
-var VERSION = true ? "0.2.1" : "0.0.0";
+var VERSION = true ? "0.3.0" : "0.0.0";
 function parseArgs(argv) {
   const options = {
     command: "serve",

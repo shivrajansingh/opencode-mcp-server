@@ -181,6 +181,10 @@ const job = await opencode_job({ jobID })
 // → { status: "done", summary: "…" }
 ```
 
+The same happens automatically: if an inline call exceeds the client timeout and the run is still
+going, the response is `{ status: "working", jobID }` instead of a lost result — poll it with
+`opencode_job`.
+
 **Persistent conversations** work the same way:
 
 ```js
