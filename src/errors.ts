@@ -100,7 +100,10 @@ export interface ToolTextResult {
 }
 
 export function ok(data: unknown): ToolTextResult {
-  return { content: [{ type: "text", text: stringify(data) }] }
+  const pretty = JSON.stringify(data, null, 2) ?? "null"
+  // Large payloads are compacted: indentation costs real context tokens in the client.
+  const text = pretty.length > 2_000 ? (JSON.stringify(data) ?? pretty) : pretty
+  return { content: [{ type: "text", text }] }
 }
 
 export function fail(error: unknown): ToolTextResult {

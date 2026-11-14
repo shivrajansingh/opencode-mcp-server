@@ -470,15 +470,18 @@ opencode_session_compact({ sessionID, wait?: true })
 
 opencode_session_history({
   sessionID, limit?: 100, cursor?, order?: "asc" | "desc",
-  include?: { text: true, toolCalls: true, reasoning: false, synthetic: false },
-  format?: "json" | "markdown" | "transcript"
-}) -> { messages, cursor, totals: { tokens, cost, tools } }
+  detail?: "summary" | "tools" | "full",
+  includeReasoning?: false,
+  format?: "json" | "markdown"
+}) -> { sessionID, title, totals, toolUsage, messages, cursor?, markdown? }
 ```
 
 - `compact` → `client.session.compact({ sessionID })`; also support
   `auto: { thresholdPercent: 80 }` to compact before a prompt when context is hot.
-- `history` → `client.message.list({ sessionID, limit, order, cursor, type })`, rendering
-  `user | assistant | tool | compaction | skill | shell | idle` into the requested format.
+- `history` → `client.message.list({ sessionID, limit, order, cursor, type })`, rendered at three
+  detail levels: `summary` (default: prompts, answers, `toolUsage` counts, totals), `tools`
+  (per-step name/status/target), `full` (raw inputs and truncated outputs). Cursor tokens are
+  omitted unless paging. Large results are compact JSON (no indentation).
 - Extra views available without new tools: `session.context()`, `session.diff()`,
   `session.export()`, `session.stats()`.
 

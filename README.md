@@ -112,7 +112,7 @@ There is no silent auto-discovery; `--discover` exists for development only.
 | `opencode_session_interrupt` | Stop the current run. |
 | `opencode_session_compact` | Summarize history to free context. |
 | `opencode_session_prompt` | Prompt with text + files, wait for the answer, return tools/usage. |
-| `opencode_session_history` | Messages as JSON or markdown transcript. |
+| `opencode_session_history` | Audit a session. `detail: "summary"` (default) returns prompts + answers + tool counts; `"tools"` adds per-step names; `"full"` returns raw inputs/outputs. |
 | `opencode_model` | List models, read the default, assign at session/project/global/agent scope. |
 | `opencode_agent` | List agents, switch agent, delegate to a subagent. |
 | `opencode_task` | One-shot delegation: create session → prompt → wait → return **summary only**. `background: true` returns a jobID immediately. |
@@ -199,12 +199,18 @@ await opencode_session_prompt({ sessionID: s.sessionID, text: "Fix the failing t
 |---|---|---|
 | Tool calls (`write`, `shell`, …) | hidden | `verbosity: "full"` |
 | Intermediate assistant turns | hidden | `verbosity: "full"` |
-| Reasoning blocks | never returned by prompt/task | `opencode_session_history { includeReasoning: true }` |
+| Reasoning blocks | never returned by prompt/task | `opencode_session_history { includeReasoning: true, detail: "full" }` |
 | Token/cost usage | hidden | `verbosity: "full"` |
 | Provider errors | **always surfaced** as `status: "error"` + `error.message` | — |
+| Session audit | payload of ~2.8 KB | `detail: "tools"` / `"full"` |
 
-`opencode_session_history` remains the explicit audit tool: it is the only place tool calls are
-readable, and only when a client asks for them.
+`opencode_session_history` remains the explicit audit tool. It defaults to `detail: "summary"`
+(prompts, answers, tool **counts**); `detail: "tools"` adds one line per step (name, status, target);
+`detail: "full"` returns raw inputs/outputs. On a real 15-message Playwright run, the default shrinks
+the payload from 18 KB / 433 lines to ~2.8 KB / 1 line.
+
+Large tool results are also emitted as compact JSON (no indentation); results under 2 KB stay
+pretty-printed for readability.
 
 The MCP client never touches the model. OpenCode runs inference through its own providers and runs
 the agentic loop with its own tools, skills, MCP servers and permissions; the bridge translates
