@@ -22,6 +22,7 @@ interface CliOptions {
   directory?: string
   allowRemoteUrl: boolean
   readOnly: boolean
+  allowFullHistory: boolean
   profile: ToolProfile
   discover: boolean
   json: boolean
@@ -35,6 +36,7 @@ function parseArgs(argv: string[]): CliOptions {
     port: 7777,
     allowRemoteUrl: false,
     readOnly: false,
+    allowFullHistory: /^(1|true|yes)$/i.test(process.env.OPENCODE_MCP_ALLOW_FULL_HISTORY ?? ""),
     profile: "full",
     discover: false,
     json: false,
@@ -78,6 +80,9 @@ function parseArgs(argv: string[]): CliOptions {
         break
       case "--read-only":
         options.readOnly = true
+        break
+      case "--allow-full-history":
+        options.allowFullHistory = true
         break
       case "--profile": {
         const value = next()
@@ -128,6 +133,8 @@ Options:
   --directory <path>     Default workspace directory
   --profile <full|minimal>  Tool surface (default full, 18 tools)
   --read-only            Disable tools that mutate sessions or files
+  --allow-full-history   Admin-only: allow detail='full' on opencode_session_history
+                         (raw tool inputs/outputs, redacted). Off by default.
   --allow-remote-url     Permit non-loopback OpenCode addresses
   --discover             Read credentials from the local OpenCode service file
   --host <host>          HTTP bind address (default 127.0.0.1)
@@ -188,6 +195,7 @@ async function main(): Promise<void> {
     bridge,
     readOnly: options.readOnly,
     allowRemoteUrl: options.allowRemoteUrl,
+    allowFullHistory: options.allowFullHistory,
     rootsProvider: async () => [],
   }
 

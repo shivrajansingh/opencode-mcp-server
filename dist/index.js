@@ -962,7 +962,7 @@ function registerPromptTools(server, ctx) {
         skills: z3.array(z3.object({ id: z3.string() })).optional(),
         wait: z3.boolean().optional().describe("Wait for the run to finish (default true)"),
         timeoutMs: z3.number().int().min(1e3).max(36e5).optional().describe("Default 45000 (kept under typical MCP client timeouts)"),
-        verbosity: z3.enum(["summary", "full"]).optional().describe("summary (default) returns only the final answer; full adds messages, tools and usage")
+        verbosity: z3.enum(["summary", "full"]).optional().describe("summary (default). 'full' is admin-only and usually disabled")
       },
       annotations: { readOnlyHint: false }
     },
@@ -971,6 +971,15 @@ function registerPromptTools(server, ctx) {
 }
 async function executePrompt(ctx, input, extra) {
   assertWritable(ctx, "sending prompts");
+  if (input.verbosity === "full" && !ctx.allowFullHistory) {
+    throw new BridgeError(
+      "INVALID_INPUT",
+      "Full verbosity is disabled on this bridge for security reasons.",
+      {
+        hint: "Omit verbosity (summary is the default). To allow full turn transcripts locally, restart with --allow-full-history."
+      }
+    );
+  }
   if (!input.text?.trim() && !(input.files?.length ?? 0)) {
     throw invalidInput("Provide text and/or at least one file.");
   }
@@ -1191,20 +1200,30 @@ function registerHistoryTools(server, ctx) {
     "opencode_session_history",
     {
       title: "Read session history",
-      description: "Audit a session. Default detail='summary' returns only what a caller usually needs: the user prompt, the assistant's answers, token totals and a count of tools used \u2014 no tool arguments or outputs. detail='tools' adds one line per step (name, status, target). detail='full' returns raw inputs/outputs.",
+      description: "Audit a session. Default detail='summary' returns only what a caller usually needs: the user prompt, the assistant's answers, token totals and a count of tools used \u2014 no tool arguments or outputs. detail='tools' adds one line per step (name and status; targets only with includeTargets=true). detail='full' is disabled for security unless the bridge was started with --allow-full-history. The full transcript is never sent by default.",
       inputSchema: {
         sessionID: z4.string(),
-        detail: z4.enum(["summary", "tools", "full"]).optional().describe("summary (default) | tools | full"),
+        detail: z4.enum(["summary", "tools", "full"]).optional().describe("summary (default) | tools | full (admin-only, usually disabled)"),
+        includeTargets: z4.boolean().optional().describe("detail='tools': include a redacted path/command target per step (default false)"),
         limit: z4.number().int().min(1).max(200).optional().describe("Default 100"),
         cursor: z4.string().optional().describe("Pagination cursor from a previous call"),
         order: z4.enum(["asc", "desc"]).optional(),
-        includeReasoning: z4.boolean().optional().describe("Include reasoning text (detail=full only)"),
+        includeReasoning: z4.boolean().optional().describe("Only with admin-enabled detail='full'"),
         format: z4.enum(["json", "markdown"]).optional().describe("Default json")
       },
       annotations: { readOnlyHint: true }
     },
     async (args) => {
       const detail = args.detail ?? "summary";
+      if (detail === "full" && !ctx.allowFullHistory) {
+        throw new BridgeError(
+          "INVALID_INPUT",
+          "Full session history is disabled on this bridge for security reasons.",
+          {
+            hint: "Use detail='summary' or detail='tools'. To allow raw tool inputs/outputs locally, restart the bridge with --allow-full-history (or OPENCODE_MCP_ALLOW_FULL_HISTORY=1)."
+          }
+        );
+      }
       const { client } = await openClient(ctx);
       const [session, response] = await Promise.all([
         client.session.get({ sessionID: args.sessionID }),
@@ -1217,7 +1236,7 @@ function registerHistoryTools(server, ctx) {
       ]);
       const messages = [];
       for (const message of response.data) {
-        const rendered = render(message, detail, args.includeReasoning ?? false);
+        const rendered = render(message, detail, args.includeReasoning ?? false, args.includeTargets ?? false);
         if (rendered) messages.push(rendered);
       }
       const toolUsage = {};
@@ -1248,7 +1267,7 @@ function registerHistoryTools(server, ctx) {
     }
   );
 }
-function render(message, detail, includeReasoning) {
+function render(message, detail, includeReasoning, includeTargets) {
   if (message.type === "user") {
     return {
       role: "user",
@@ -1274,7 +1293,7 @@ function render(message, detail, includeReasoning) {
           tools: tools.map((part) => ({
             name: part.name ?? part.tool ?? "tool",
             status: part.state?.status ?? "unknown",
-            ...toolTarget(part.state?.input) ? { target: toolTarget(part.state?.input) } : {}
+            ...includeTargets && toolTarget(part.state?.input) ? { target: redact(toolTarget(part.state?.input)) } : {}
           }))
         } : {}
       };
@@ -1291,8 +1310,8 @@ function render(message, detail, includeReasoning) {
         tools: tools.map((part) => ({
           name: part.name ?? part.tool ?? "tool",
           status: part.state?.status ?? "unknown",
-          input: part.state?.input,
-          output: truncate(part.state?.output, 300)
+          input: redactValue(part.state?.input),
+          output: redactValue(truncate(part.state?.output, 300))
         }))
       } : {},
       ...message.cost !== void 0 ? { cost: message.cost } : {},
@@ -1322,6 +1341,15 @@ function truncate(value, max) {
   const text = typeof value === "string" ? value : JSON.stringify(value);
   if (!text) return void 0;
   return text.length > max ? `${text.slice(0, max)}\u2026` : text;
+}
+function redactValue(value) {
+  if (value === void 0 || value === null) return value;
+  if (typeof value === "string") return redact(value);
+  try {
+    return JSON.parse(redact(JSON.stringify(value)));
+  } catch {
+    return redact(String(value));
+  }
 }
 function toMarkdown(title, messages) {
   const lines = [`# ${title ?? "Session transcript"}`, ""];
@@ -1741,7 +1769,7 @@ function registerTaskTools(server, ctx) {
         parentSessionID: z6.string().optional().describe("Attach the task as a subagent of this session"),
         wait: z6.boolean().optional().describe("Wait for the run (default true; ignored when background=true)"),
         timeoutMs: z6.number().int().min(1e3).max(36e5).optional().describe("Default 45000 inline, 1800000 in background"),
-        verbosity: z6.enum(["summary", "full"]).optional().describe("Default summary"),
+        verbosity: z6.enum(["summary", "full"]).optional().describe("summary (default). 'full' is admin-only and usually disabled"),
         background: z6.boolean().optional().describe("Return immediately with a jobID instead of waiting")
       },
       annotations: { readOnlyHint: false }
@@ -2127,7 +2155,7 @@ function registerTools(server, ctx, profile = "full") {
 }
 
 // src/index.ts
-var VERSION = true ? "0.4.0" : "0.0.0";
+var VERSION = true ? "0.5.0" : "0.0.0";
 function parseArgs(argv) {
   const options = {
     command: "serve",
@@ -2136,6 +2164,7 @@ function parseArgs(argv) {
     port: 7777,
     allowRemoteUrl: false,
     readOnly: false,
+    allowFullHistory: /^(1|true|yes)$/i.test(process.env.OPENCODE_MCP_ALLOW_FULL_HISTORY ?? ""),
     profile: "full",
     discover: false,
     json: false
@@ -2177,6 +2206,9 @@ function parseArgs(argv) {
         break;
       case "--read-only":
         options.readOnly = true;
+        break;
+      case "--allow-full-history":
+        options.allowFullHistory = true;
         break;
       case "--profile": {
         const value = next();
@@ -2227,6 +2259,8 @@ Options:
   --directory <path>     Default workspace directory
   --profile <full|minimal>  Tool surface (default full, 18 tools)
   --read-only            Disable tools that mutate sessions or files
+  --allow-full-history   Admin-only: allow detail='full' on opencode_session_history
+                         (raw tool inputs/outputs, redacted). Off by default.
   --allow-remote-url     Permit non-loopback OpenCode addresses
   --discover             Read credentials from the local OpenCode service file
   --host <host>          HTTP bind address (default 127.0.0.1)
@@ -2280,6 +2314,7 @@ async function main() {
     bridge,
     readOnly: options.readOnly,
     allowRemoteUrl: options.allowRemoteUrl,
+    allowFullHistory: options.allowFullHistory,
     rootsProvider: async () => []
   };
   if (options.http) {

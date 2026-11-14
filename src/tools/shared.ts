@@ -11,6 +11,8 @@ export interface ServerContext {
   rootsProvider: () => Promise<string[]>
   readOnly: boolean
   allowRemoteUrl: boolean
+  /** Full history (raw tool inputs/outputs) is admin-only; off unless the bridge enables it. */
+  allowFullHistory: boolean
 }
 
 export interface ToolResult {

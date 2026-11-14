@@ -112,7 +112,7 @@ There is no silent auto-discovery; `--discover` exists for development only.
 | `opencode_session_interrupt` | Stop the current run. |
 | `opencode_session_compact` | Summarize history to free context. |
 | `opencode_session_prompt` | Prompt with text + files, wait for the answer, return tools/usage. |
-| `opencode_session_history` | Audit a session. `detail: "summary"` (default) returns prompts + answers + tool counts; `"tools"` adds per-step names; `"full"` returns raw inputs/outputs. |
+| `opencode_session_history` | Audit a session. `detail: "summary"` (default) returns prompts, answers and tool counts; `"tools"` adds step names/status. Raw inputs/outputs (`"full"`) are admin-disabled. |
 | `opencode_model` | List models, read the default, assign at session/project/global/agent scope. |
 | `opencode_agent` | List agents, switch agent, delegate to a subagent. |
 | `opencode_task` | One-shot delegation: create session → prompt → wait → return **summary only**. `background: true` returns a jobID immediately. |
@@ -199,15 +199,17 @@ await opencode_session_prompt({ sessionID: s.sessionID, text: "Fix the failing t
 |---|---|---|
 | Tool calls (`write`, `shell`, …) | hidden | `verbosity: "full"` |
 | Intermediate assistant turns | hidden | `verbosity: "full"` |
-| Reasoning blocks | never returned by prompt/task | `opencode_session_history { includeReasoning: true, detail: "full" }` |
-| Token/cost usage | hidden | `verbosity: "full"` |
+| Reasoning blocks | never returned | admin-only with `detail: "full"` + `--allow-full-history` |
+| Token/cost usage | hidden | admin-only `verbosity: "full"` |
 | Provider errors | **always surfaced** as `status: "error"` + `error.message` | — |
-| Session audit | payload of ~2.8 KB | `detail: "tools"` / `"full"` |
+| Session audit | prompts, answers, tool counts (~2.8 KB) | `detail: "tools"` |
 
 `opencode_session_history` remains the explicit audit tool. It defaults to `detail: "summary"`
-(prompts, answers, tool **counts**); `detail: "tools"` adds one line per step (name, status, target);
-`detail: "full"` returns raw inputs/outputs. On a real 15-message Playwright run, the default shrinks
-the payload from 18 KB / 433 lines to ~2.8 KB / 1 line.
+(prompts, answers, tool **counts**). `detail: "tools"` adds per-step name/status; targets are opt-in
+and redacted. **`detail: "full"` (raw tool inputs/outputs) and `verbosity: "full"` are disabled
+unless the bridge was started with `--allow-full-history`** — an operator-level flag, not something a
+prompt can enable. On a real 15-message Playwright run, the default shrinks the payload from
+18 KB / 433 lines to ~2.8 KB / 1 line.
 
 Large tool results are also emitted as compact JSON (no indentation); results under 2 KB stay
 pretty-printed for readability.
@@ -251,6 +253,9 @@ curl -X POST http://127.0.0.1:7777/configure \
 - The bridge can run an agent with shell access — treat it as remote code execution by design.
 - Loopback binding, bearer token, and loopback-only OpenCode URLs by default.
 - `--read-only` disables prompts, compaction, deletes, moves, uploads and permission replies.
+- **Raw transcripts are off by default.** `detail: "full"` and `verbosity: "full"` return an error
+  unless the bridge was started with `--allow-full-history` (or `OPENCODE_MCP_ALLOW_FULL_HISTORY=1`).
+  Even then, likely secrets are redacted.
 - `allowedRoots` (config file or `OPENCODE_MCP_ALLOWED_ROOTS`) blocks path escapes, symlink-safe.
 - Passwords never appear in logs, errors, or tool output; the audit-friendly paths redact them.
 - `opencode_configure` cannot change `allowedRoots` or the permission profile.

@@ -1,5 +1,7 @@
 import { z } from "zod"
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
+import { BridgeError } from "../errors.js"
+import { redact } from "../log.js"
 import { openClient, register, workspaceFor, type ServerContext } from "./shared.js"
 
 type Detail = "summary" | "tools" | "full"
@@ -13,23 +15,41 @@ export function registerHistoryTools(server: McpServer, ctx: ServerContext): voi
       description:
         "Audit a session. Default detail='summary' returns only what a caller usually needs: the user prompt, " +
         "the assistant's answers, token totals and a count of tools used — no tool arguments or outputs. " +
-        "detail='tools' adds one line per step (name, status, target). detail='full' returns raw inputs/outputs.",
+        "detail='tools' adds one line per step (name and status; targets only with includeTargets=true). " +
+        "detail='full' is disabled for security unless the bridge was started with --allow-full-history. " +
+        "The full transcript is never sent by default.",
       inputSchema: {
         sessionID: z.string(),
         detail: z
           .enum(["summary", "tools", "full"])
           .optional()
-          .describe("summary (default) | tools | full"),
+          .describe("summary (default) | tools | full (admin-only, usually disabled)"),
+        includeTargets: z
+          .boolean()
+          .optional()
+          .describe("detail='tools': include a redacted path/command target per step (default false)"),
         limit: z.number().int().min(1).max(200).optional().describe("Default 100"),
         cursor: z.string().optional().describe("Pagination cursor from a previous call"),
         order: z.enum(["asc", "desc"]).optional(),
-        includeReasoning: z.boolean().optional().describe("Include reasoning text (detail=full only)"),
+        includeReasoning: z.boolean().optional().describe("Only with admin-enabled detail='full'"),
         format: z.enum(["json", "markdown"]).optional().describe("Default json"),
       },
       annotations: { readOnlyHint: true },
     },
     async (args) => {
       const detail: Detail = args.detail ?? "summary"
+
+      if (detail === "full" && !ctx.allowFullHistory) {
+        throw new BridgeError(
+          "INVALID_INPUT",
+          "Full session history is disabled on this bridge for security reasons.",
+          {
+            hint:
+              "Use detail='summary' or detail='tools'. To allow raw tool inputs/outputs locally, restart the " +
+              "bridge with --allow-full-history (or OPENCODE_MCP_ALLOW_FULL_HISTORY=1).",
+          },
+        )
+      }
       const { client } = await openClient(ctx)
       const [session, response] = await Promise.all([
         client.session.get({ sessionID: args.sessionID }),
@@ -43,7 +63,7 @@ export function registerHistoryTools(server: McpServer, ctx: ServerContext): voi
 
       const messages: any[] = []
       for (const message of response.data) {
-        const rendered = render(message, detail, args.includeReasoning ?? false)
+        const rendered = render(message, detail, args.includeReasoning ?? false, args.includeTargets ?? false)
         if (rendered) messages.push(rendered)
       }
 
@@ -81,7 +101,7 @@ export function registerHistoryTools(server: McpServer, ctx: ServerContext): voi
   )
 }
 
-function render(message: any, detail: Detail, includeReasoning: boolean): unknown | null {
+function render(message: any, detail: Detail, includeReasoning: boolean, includeTargets: boolean): unknown | null {
   if (message.type === "user") {
     return {
       role: "user",
@@ -116,14 +136,16 @@ function render(message: any, detail: Detail, includeReasoning: boolean): unknow
               tools: tools.map((part) => ({
                 name: part.name ?? part.tool ?? "tool",
                 status: part.state?.status ?? "unknown",
-                ...(toolTarget(part.state?.input) ? { target: toolTarget(part.state?.input) } : {}),
+                ...(includeTargets && toolTarget(part.state?.input)
+                  ? { target: redact(toolTarget(part.state?.input)!) }
+                  : {}),
               })),
             }
           : {}),
       }
     }
 
-    // detail === "full"
+    // detail === "full" (admin-enabled only). Redact secrets even then.
     const reasoning = includeReasoning
       ? parts
           .filter((part) => part.type === "reasoning")
@@ -142,8 +164,8 @@ function render(message: any, detail: Detail, includeReasoning: boolean): unknow
             tools: tools.map((part) => ({
               name: part.name ?? part.tool ?? "tool",
               status: part.state?.status ?? "unknown",
-              input: part.state?.input,
-              output: truncate(part.state?.output, 300),
+              input: redactValue(part.state?.input),
+              output: redactValue(truncate(part.state?.output, 300)),
             })),
           }
         : {}),
@@ -178,6 +200,17 @@ function truncate(value: unknown, max: number): string | undefined {
   const text = typeof value === "string" ? value : JSON.stringify(value)
   if (!text) return undefined
   return text.length > max ? `${text.slice(0, max)}…` : text
+}
+
+/** Redact a structured value while keeping it JSON-friendly. */
+function redactValue<T>(value: T): T {
+  if (value === undefined || value === null) return value
+  if (typeof value === "string") return redact(value) as unknown as T
+  try {
+    return JSON.parse(redact(JSON.stringify(value))) as T
+  } catch {
+    return redact(String(value)) as unknown as T
+  }
 }
 
 function toMarkdown(title: string | undefined, messages: any[]): string {

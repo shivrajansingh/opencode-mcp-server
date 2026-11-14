@@ -186,7 +186,7 @@ export function registerTaskTools(server: McpServer, ctx: ServerContext): void {
           .max(3_600_000)
           .optional()
           .describe("Default 45000 inline, 1800000 in background"),
-        verbosity: z.enum(["summary", "full"]).optional().describe("Default summary"),
+        verbosity: z.enum(["summary", "full"]).optional().describe("summary (default). 'full' is admin-only and usually disabled"),
         background: z.boolean().optional().describe("Return immediately with a jobID instead of waiting"),
       },
       annotations: { readOnlyHint: false },

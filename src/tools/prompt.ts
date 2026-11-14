@@ -4,6 +4,7 @@ import { z } from "zod"
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
 import type { OpenCodeClient } from "@opencode/client"
 import { invalidInput } from "../errors.js"
+import { BridgeError } from "../errors.js"
 import { assertWritable, openClient, register, workspaceFor, type ServerContext } from "./shared.js"
 
 const MAX_ATTACHMENT_BYTES = 10 * 1024 * 1024
@@ -45,7 +46,7 @@ export function registerPromptTools(server: McpServer, ctx: ServerContext): void
         verbosity: z
           .enum(["summary", "full"])
           .optional()
-          .describe("summary (default) returns only the final answer; full adds messages, tools and usage"),
+          .describe("summary (default). 'full' is admin-only and usually disabled"),
       },
       annotations: { readOnlyHint: false },
     },
@@ -66,6 +67,15 @@ export interface PromptInput {
 
 export async function executePrompt(ctx: ServerContext, input: PromptInput, extra?: unknown) {
   assertWritable(ctx, "sending prompts")
+  if (input.verbosity === "full" && !ctx.allowFullHistory) {
+    throw new BridgeError(
+      "INVALID_INPUT",
+      "Full verbosity is disabled on this bridge for security reasons.",
+      {
+        hint: "Omit verbosity (summary is the default). To allow full turn transcripts locally, restart with --allow-full-history.",
+      },
+    )
+  }
   if (!input.text?.trim() && !(input.files?.length ?? 0)) {
     throw invalidInput("Provide text and/or at least one file.")
   }

@@ -480,8 +480,9 @@ opencode_session_history({
   `auto: { thresholdPercent: 80 }` to compact before a prompt when context is hot.
 - `history` → `client.message.list({ sessionID, limit, order, cursor, type })`, rendered at three
   detail levels: `summary` (default: prompts, answers, `toolUsage` counts, totals), `tools`
-  (per-step name/status/target), `full` (raw inputs and truncated outputs). Cursor tokens are
-  omitted unless paging. Large results are compact JSON (no indentation).
+  (per-step name/status; targets opt-in and redacted), `full` (raw inputs and truncated outputs,
+  **admin-only** behind `--allow-full-history`, redacted even then). Cursor tokens are omitted unless
+  paging. Large results are compact JSON (no indentation).
 - Extra views available without new tools: `session.context()`, `session.diff()`,
   `session.export()`, `session.stats()`.
 
@@ -576,6 +577,9 @@ An MCP tool that drives an agent with shell access is **remote code execution by
 10. **Config tool guardrails** — `opencode_configure` validates first, never echoes the password,
     cannot change `allowedRoots`/`permissionProfile`, and accepts loopback URLs only unless
     `--allow-remote-url` is set (§2.4).
+11. **No raw transcripts by default** — `detail: "full"` and `verbosity: "full"` are refused unless
+    the operator starts the bridge with `--allow-full-history`; redaction still applies when enabled.
+    A prompt cannot widen this.
 
 ---
 

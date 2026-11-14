@@ -170,6 +170,32 @@ await withClient({ OPENCODE_URL: url, OPENCODE_PASSWORD: password }, async (clie
     check("history has messages", Array.isArray(history.messages) && history.messages.length >= 2, `${history.messages?.length}`)
     check("markdown rendered", typeof history.markdown === "string" && history.markdown.includes("## "), "")
 
+    const blockedFull = await client.callTool({
+      name: "opencode_session_history",
+      arguments: { sessionID: created.sessionID, detail: "full" },
+    })
+    check(
+      "full history is blocked by default",
+      blockedFull.isError === true && text(blockedFull).includes("disabled"),
+      text(blockedFull).slice(0, 140),
+    )
+
+    const blockedVerbose = await client.callTool({
+      name: "opencode_session_prompt",
+      arguments: { sessionID: created.sessionID, text: "this must not be sent", verbosity: "full" },
+    })
+    check(
+      "full verbosity is blocked by default",
+      blockedVerbose.isError === true && text(blockedVerbose).includes("disabled"),
+      text(blockedVerbose).slice(0, 140),
+    )
+
+    const toolDetail = JSON.parse(
+      text(await client.callTool({ name: "opencode_session_history", arguments: { sessionID: created.sessionID, detail: "tools" } })),
+    )
+    const entries = toolDetail.messages.flatMap((message) => message.tools ?? [])
+    check("tools detail never includes raw inputs", entries.every((entry) => entry.input === undefined))
+
     const compact = JSON.parse(
       text(await client.callTool({ name: "opencode_session_compact", arguments: { sessionID: created.sessionID, wait: true } })),
     )
